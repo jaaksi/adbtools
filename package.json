@@ -15,7 +15,9 @@
     "@tauri-apps/plugin-dialog": "^2.7.0",
     "@tauri-apps/plugin-opener": "^2",
     "element-plus": "^2.13.7",
-    "vue": "^3.5.13"
+    "pinia": "^3.0.4",
+    "vue": "^3.5.13",
+    "vue3-google-login": "^2.0.37"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",

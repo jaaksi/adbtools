@@ -6,6 +6,7 @@ import DevicePanel from "./components/DevicePanel.vue";
 import AppManager from "./components/AppManager.vue";
 import FileManager from "./components/FileManager.vue";
 import ToolsPanel from "./components/ToolsPanel.vue";
+import GoogleAuth from "./components/GoogleAuth.vue";
 
 interface Device {
   serial: string;
@@ -110,24 +111,29 @@ onMounted(() => {
       </el-aside>
 
       <el-main class="main-content">
-        <DevicePanel 
-          v-if="activeTab === 'devices'" 
-          :devices="devices"
-          :selected-device="selectedDevice"
-          @refresh="refreshDevices"
-        />
-        <AppManager 
-          v-else-if="activeTab === 'apps'" 
-          :selected-device="selectedDevice"
-        />
-        <FileManager 
-          v-else-if="activeTab === 'files'" 
-          :selected-device="selectedDevice"
-        />
-        <ToolsPanel 
-          v-else-if="activeTab === 'tools'" 
-          :selected-device="selectedDevice"
-        />
+        <div class="main-header">
+          <GoogleAuth />
+        </div>
+        <div class="main-body">
+          <DevicePanel 
+            v-if="activeTab === 'devices'" 
+            :devices="devices"
+            :selected-device="selectedDevice"
+            @refresh="refreshDevices"
+          />
+          <AppManager 
+            v-else-if="activeTab === 'apps'" 
+            :selected-device="selectedDevice"
+          />
+          <FileManager 
+            v-else-if="activeTab === 'files'" 
+            :selected-device="selectedDevice"
+          />
+          <ToolsPanel 
+            v-else-if="activeTab === 'tools'" 
+            :selected-device="selectedDevice"
+          />
+        </div>
       </el-main>
     </el-container>
   </div>
@@ -268,10 +274,33 @@ html, body {
   overflow-y: auto;
   height: 100%;
   overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
 }
 
 /* 隐藏滚动条 */
 .main-content::-webkit-scrollbar {
+  display: none;
+}
+
+.main-header {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  margin-bottom: 20px;
+  padding: 10px 20px;
+  background: #fff;
+  border-radius: 8px;
+  box-shadow: 0 2px 12px 0 rgba(0, 0, 0, 0.05);
+}
+
+.main-body {
+  flex: 1;
+  overflow-y: auto;
+}
+
+/* 隐藏滚动条 */
+.main-body::-webkit-scrollbar {
   display: none;
 }
 </style>

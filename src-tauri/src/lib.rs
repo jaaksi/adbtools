@@ -465,6 +465,35 @@ fn run_shell_command(serial: &str, command: &str) -> Result<String, String> {
     run_adb_command(&cmd_args)
 }
 
+#[tauri::command]
+fn open_url(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(url)
+            .spawn()
+            .map_err(|e| format!("Failed to open URL: {}", e))?;
+    }
+    
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/c", "start", url])
+            .spawn()
+            .map_err(|e| format!("Failed to open URL: {}", e))?;
+    }
+    
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(url)
+            .spawn()
+            .map_err(|e| format!("Failed to open URL: {}", e))?;
+    }
+    
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -492,6 +521,7 @@ pub fn run() {
             start_screen_record,
             reboot_device,
             run_shell_command,
+            open_url,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
