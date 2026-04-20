@@ -46,6 +46,7 @@ onMounted(() => {
         <div class="logo">
           <el-icon size="32" color="#409EFF"><Monitor /></el-icon>
           <span>Adb工具</span>
+          <GoogleAuth class="logo-auth" />
         </div>
         
         <div class="device-section">
@@ -111,9 +112,6 @@ onMounted(() => {
       </el-aside>
 
       <el-main class="main-content">
-        <div class="main-header">
-          <GoogleAuth />
-        </div>
         <div class="main-body">
           <DevicePanel 
             v-if="activeTab === 'devices'" 
@@ -181,9 +179,9 @@ html, body {
   height: 60px;
   display: flex;
   align-items: center;
-  justify-content: center;
   gap: 10px;
-  font-size: 20px;
+  padding: 0 15px;
+  font-size: 18px;
   font-weight: bold;
   border-bottom: 1px solid #e4e7ed;
   color: #303133;
@@ -283,15 +281,8 @@ html, body {
   display: none;
 }
 
-.main-header {
-  display: flex;
-  justify-content: flex-end;
-  align-items: center;
-  margin-bottom: 20px;
-  padding: 10px 20px;
-  background: #fff;
-  border-radius: 8px;
-  box-shadow: 0 2px 12px 0 rgba(0, 0, 0, 0.05);
+.logo-auth {
+  margin-left: auto;
 }
 
 .main-body {

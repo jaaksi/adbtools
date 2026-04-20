@@ -1,5 +1,14 @@
 use serde::{Deserialize, Serialize};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
 use std::process::Command;
+use std::sync::mpsc::{channel, Sender, TryRecvError};
+use std::sync::Mutex;
+use std::thread;
+use std::time::Duration;
+use tauri::{AppHandle, Emitter, State};
+
+pub struct OAuthState(pub Mutex<Option<Sender<()>>>);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Device {
@@ -494,11 +503,124 @@ fn open_url(url: &str) -> Result<(), String> {
     Ok(())
 }
 
+// 后端代理下载图片，返回 data URL（用于绕开 webview 请求头导致的 429 等问题）
+#[tauri::command]
+fn fetch_image_as_data_url(url: String) -> Result<String, String> {
+    use base64::{engine::general_purpose, Engine as _};
+
+    let response = ureq::get(&url)
+        .set("User-Agent", "Mozilla/5.0")
+        .call()
+        .map_err(|e| format!("下载图片失败: {}", e))?;
+
+    let content_type = response
+        .header("Content-Type")
+        .unwrap_or("image/jpeg")
+        .to_string();
+
+    let mut bytes: Vec<u8> = Vec::new();
+    response
+        .into_reader()
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("读取图片失败: {}", e))?;
+
+    let encoded = general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:{};base64,{}", content_type, encoded))
+}
+
+// 启动本地回环 HTTP 服务器接收 Google OAuth 回调
+// 因为 Google 会把 token 放在 URL fragment (#...) 里，服务器收不到，
+// 所以先返回一段 HTML，让浏览器把 fragment 作为 query 重新请求 /callback
+#[tauri::command]
+fn start_oauth_server(app: AppHandle, state: State<'_, OAuthState>) -> Result<u16, String> {
+    // 关闭之前可能残留的 server
+    {
+        let mut guard = state.0.lock().unwrap();
+        if let Some(tx) = guard.take() {
+            let _ = tx.send(());
+        }
+    }
+    // 等旧 socket 释放
+    thread::sleep(Duration::from_millis(300));
+
+    let listener = TcpListener::bind("127.0.0.1:8765")
+        .map_err(|e| format!("端口 8765 占用，请关闭占用程序后重试: {}", e))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("设置非阻塞失败: {}", e))?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+
+    let (tx, rx) = channel::<()>();
+    *state.0.lock().unwrap() = Some(tx);
+
+    thread::spawn(move || {
+        loop {
+            // 收到关闭信号立即退出
+            match rx.try_recv() {
+                Ok(_) | Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => {}
+            }
+
+            let (mut stream, _) = match listener.accept() {
+                Ok(s) => s,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                Err(_) => break,
+            };
+            let _ = stream.set_nonblocking(false);
+
+            let mut request_line = String::new();
+            {
+                let mut reader = BufReader::new(&stream);
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+            }
+
+            let path = request_line
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("/")
+                .to_string();
+
+            if path.starts_with("/callback") {
+                let query = path
+                    .split_once('?')
+                    .map(|(_, q)| q.to_string())
+                    .unwrap_or_default();
+
+                let _ = app.emit("oauth_callback", query);
+
+                let body = "<html><head><meta charset=\"utf-8\"></head><body style=\"font-family:sans-serif;text-align:center;padding-top:80px\"><h2>认证完成</h2><p>可以关闭此页面返回应用</p></body></html>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                break; // 处理完回调后关闭 server
+            } else {
+                // 根路径：返回 HTML 把 fragment 转成 query 再请求一次
+                let body = "<html><body><script>var h=window.location.hash.slice(1);window.location.replace('/callback?'+h);</script></body></html>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        }
+    });
+
+    Ok(port)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .manage(OAuthState(Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
             get_devices,
             get_device_info,
@@ -522,6 +644,8 @@ pub fn run() {
             reboot_device,
             run_shell_command,
             open_url,
+            start_oauth_server,
+            fetch_image_as_data_url,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,27 +1,101 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue';
+import { onMounted } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { useAuthStore } from '../stores/auth';
 import { GOOGLE_AUTH_CONFIG, isGoogleAuthConfigured } from '../config/googleAuth';
+import type { GoogleUserInfo } from '../config/googleAuth';
 
 const authStore = useAuthStore();
 
-// 在浏览器中打开 Google 认证页面
+let unlistenCallback: UnlistenFn | null = null;
+
+// 启动 Google 认证流程：Rust 起本地回环服务器 → 浏览器完成授权 → 回调写回 app
 async function openGoogleAuth() {
-  // 使用 OAuth 2.0 Implicit Grant Flow
-  const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${GOOGLE_AUTH_CONFIG.clientId}&redirect_uri=http://localhost:1420&response_type=token&scope=email%20profile%20openid&prompt=select_account`;
-  
-  console.log('Opening Google auth in browser:', authUrl);
-  
   try {
-    // 使用 Tauri 在系统浏览器中打开
+    // 先清理上一次可能遗留的监听
+    if (unlistenCallback) {
+      unlistenCallback();
+      unlistenCallback = null;
+    }
+
+    const port = await invoke<number>('start_oauth_server');
+    const redirectUri = `http://127.0.0.1:${port}`;
+
+    // 监听 Rust 端回调（只处理一次）
+    unlistenCallback = await listen<string>('oauth_callback', async (event) => {
+      if (unlistenCallback) {
+        unlistenCallback();
+        unlistenCallback = null;
+      }
+
+      const params = new URLSearchParams(event.payload);
+      const idToken = params.get('id_token');
+      const accessToken = params.get('access_token');
+      const error = params.get('error');
+
+      if (error) {
+        alert('Google 认证失败: ' + error);
+        return;
+      }
+
+      // 优先用 id_token 本地解出用户信息
+      if (idToken) {
+        const userInfo = authStore.decodeCredential(idToken);
+        if (userInfo) {
+          // 头像通过 Rust 代理转成 data URL，绕开 webview 限流
+          if (userInfo.picture) {
+            try {
+              userInfo.picture = await invoke<string>('fetch_image_as_data_url', {
+                url: userInfo.picture,
+              });
+            } catch (e) {
+              console.warn('头像代理下载失败，保留原始 URL:', e);
+            }
+          }
+          authStore.setUser(userInfo);
+        }
+        authStore.setToken(idToken);
+        return;
+      }
+
+      // 兜底：用 access_token 调 userinfo
+      if (accessToken) {
+        authStore.setToken(accessToken);
+        try {
+          const res = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+            headers: { Authorization: `Bearer ${accessToken}` },
+          });
+          const u = await res.json();
+          const info: GoogleUserInfo = {
+            id: u.sub,
+            email: u.email,
+            name: u.name,
+            picture: u.picture,
+            givenName: u.given_name,
+            familyName: u.family_name,
+          };
+          authStore.setUser(info);
+        } catch (e) {
+          console.error('Failed to fetch userinfo:', e);
+        }
+      }
+    });
+
+    const nonce = Math.random().toString(36).slice(2) + Date.now().toString(36);
+    const authUrl =
+      `https://accounts.google.com/o/oauth2/v2/auth` +
+      `?client_id=${encodeURIComponent(GOOGLE_AUTH_CONFIG.clientId)}` +
+      `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+      `&response_type=${encodeURIComponent('token id_token')}` +
+      `&scope=${encodeURIComponent('openid email profile')}` +
+      `&nonce=${nonce}` +
+      `&prompt=select_account`;
+
     await invoke('open_url', { url: authUrl });
-    
-    // 提示用户
-    alert('认证页面已在浏览器中打开。\n\n认证完成后，请复制浏览器地址栏中的 #credential=xxx 或 #access_token=xxx 部分，然后在应用控制台中执行:\n\nauthStore.setToken("你的 token");\nauthStore.setUser(authStore.decodeCredential("你的 token"));');
   } catch (error) {
-    console.error('Failed to open browser:', error);
-    alert('打开浏览器失败：' + error);
+    console.error('Failed to start OAuth:', error);
+    alert('启动认证失败: ' + error);
   }
 }
 
@@ -32,27 +106,7 @@ function handleLogout() {
 }
 
 onMounted(() => {
-  // 从 localStorage 加载用户
   authStore.loadUserFromStorage();
-  
-  // 检查 URL hash 中是否有认证信息（重定向回来后的处理）
-  if (window.location.hash) {
-    const hashParams = new URLSearchParams(window.location.hash.substring(1));
-    const credential = hashParams.get('credential');
-    const accessToken = hashParams.get('access_token');
-    
-    if (credential) {
-      console.log('Found credential in hash');
-      handleLoginSuccess({ credential });
-      // 清除 hash
-      window.history.replaceState({}, document.title, window.location.pathname);
-    } else if (accessToken) {
-      console.log('Found access_token in hash');
-      authStore.setToken(accessToken);
-      // 清除 hash
-      window.history.replaceState({}, document.title, window.location.pathname);
-    }
-  }
 });
 </script>
 
@@ -62,13 +116,14 @@ onMounted(() => {
     <div v-if="authStore.isAuthenticated" class="user-info">
       <el-dropdown>
         <div class="user-profile">
-          <el-avatar 
-            :src="authStore.user?.picture" 
-            :size="32"
-            class="user-avatar"
-          />
-          <span class="user-name">{{ authStore.user?.name }}</span>
-          <el-icon><Arrow-down /></el-icon>
+          <el-avatar :size="32" class="user-avatar">
+            <img
+              v-if="authStore.user?.picture"
+              :src="authStore.user.picture"
+              referrerpolicy="no-referrer"
+              alt="avatar"
+            />
+          </el-avatar>
         </div>
         <template #dropdown>
           <el-dropdown-menu>
@@ -98,22 +153,20 @@ onMounted(() => {
           </template>
         </el-alert>
       </div>
-      <div v-else class="login-button-container">
-        <el-button 
-          type="danger" 
-          size="large"
-          @click="openGoogleAuth"
-        >
-          <svg class="google-icon" viewBox="0 0 24 24">
-            <path fill="currentColor" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
-            <path fill="currentColor" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
-            <path fill="currentColor" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
-            <path fill="currentColor" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
-          </svg>
-          使用 Google 账号登录
-        </el-button>
-        <p class="login-hint">点击后将在浏览器中打开认证页面</p>
-      </div>
+      <button
+        v-else
+        type="button"
+        class="google-icon-btn"
+        title="使用 Google 账号登录"
+        @click="openGoogleAuth"
+      >
+        <svg viewBox="0 0 48 48" width="20" height="20">
+          <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"></path>
+          <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"></path>
+          <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"></path>
+          <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"></path>
+        </svg>
+      </button>
     </div>
   </div>
 </template>
@@ -147,6 +200,13 @@ onMounted(() => {
   border: 2px solid #e4e7ed;
 }
 
+.user-avatar :deep(img) {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
 .user-name {
   font-size: 14px;
   color: #606266;
@@ -165,22 +225,22 @@ onMounted(() => {
   width: 250px;
 }
 
-.login-button-container {
-  display: flex;
-  flex-direction: column;
+.google-icon-btn {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  display: inline-flex;
   align-items: center;
-  gap: 8px;
+  justify-content: center;
+  background: #fff;
+  border: 1px solid #e4e7ed;
+  border-radius: 50%;
+  cursor: pointer;
+  transition: box-shadow 0.2s, border-color 0.2s;
 }
 
-.google-icon {
-  width: 18px;
-  height: 18px;
-  margin-right: 8px;
-}
-
-.login-hint {
-  font-size: 12px;
-  color: #909399;
-  margin: 0;
+.google-icon-btn:hover {
+  border-color: #c0c4cc;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
 }
 </style>
