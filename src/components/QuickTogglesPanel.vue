@@ -169,6 +169,32 @@ async function openDevOptions() {
   }
 }
 
+async function openLanguageSettings() {
+  if (!props.selectedDevice) {
+    ElMessage.warning("请先选择设备");
+    return;
+  }
+  try {
+    await invoke("open_language_settings", { serial: props.selectedDevice });
+    ElMessage.success("已在设备上打开语言设置");
+  } catch (e) {
+    ElMessage.error(`打开语言设置失败: ${e}`);
+  }
+}
+
+async function openDateSettings() {
+  if (!props.selectedDevice) {
+    ElMessage.warning("请先选择设备");
+    return;
+  }
+  try {
+    await invoke("open_date_settings", { serial: props.selectedDevice });
+    ElMessage.success("已在设备上打开日期和时间设置");
+  } catch (e) {
+    ElMessage.error(`打开日期设置失败: ${e}`);
+  }
+}
+
 onMounted(() => {
   loadAllStates();
 });
@@ -196,12 +222,20 @@ watch(
       <el-card class="entry-card">
         <div class="entry-row">
           <div>
-            <div class="entry-title">开发者选项</div>
-            <div class="entry-desc">在设备上直接打开系统「开发者选项」设置页</div>
+            <div class="entry-title">系统设置入口</div>
+            <div class="entry-desc">直接跳转到常用的系统设置页面</div>
           </div>
-          <el-button type="primary" :icon="SetUp" @click="openDevOptions">
-            打开开发者选项
-          </el-button>
+          <div class="entry-actions">
+            <el-button type="primary" :icon="SetUp" @click="openDevOptions">
+              打开开发者选项
+            </el-button>
+            <el-button @click="openLanguageSettings">
+              打开语言设置
+            </el-button>
+            <el-button @click="openDateSettings">
+              打开日期和时间
+            </el-button>
+          </div>
         </div>
       </el-card>
 
@@ -361,6 +395,12 @@ watch(
   align-items: center;
   justify-content: space-between;
   gap: 16px;
+}
+
+.entry-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 
 .entry-title {

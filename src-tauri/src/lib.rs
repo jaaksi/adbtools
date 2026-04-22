@@ -1272,6 +1272,22 @@ fn open_dev_options(serial: &str) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn open_language_settings(serial: &str) -> Result<String, String> {
+    run_adb_command(&[
+        "-s", serial, "shell", "am", "start", "-a",
+        "android.settings.LOCALE_SETTINGS",
+    ])
+}
+
+#[tauri::command]
+fn open_date_settings(serial: &str) -> Result<String, String> {
+    run_adb_command(&[
+        "-s", serial, "shell", "am", "start", "-a",
+        "android.settings.DATE_SETTINGS",
+    ])
+}
+
+#[tauri::command]
 fn get_show_layout_bounds(serial: &str) -> Result<bool, String> {
     Ok(read_bool_setting(&[
         "-s", serial, "shell", "getprop", "debug.layout",
@@ -1460,6 +1476,8 @@ pub fn run() {
             get_wifi_enabled,
             set_wifi_enabled,
             open_dev_options,
+            open_language_settings,
+            open_date_settings,
             get_show_layout_bounds,
             set_show_layout_bounds,
             get_show_touches,
