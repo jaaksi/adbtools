@@ -6,6 +6,7 @@ import DevicePanel from "./components/DevicePanel.vue";
 import AppManager from "./components/AppManager.vue";
 import FileManager from "./components/FileManager.vue";
 import ToolsPanel from "./components/ToolsPanel.vue";
+import QuickTogglesPanel from "./components/QuickTogglesPanel.vue";
 import GoogleAuth from "./components/GoogleAuth.vue";
 
 interface Device {
@@ -108,6 +109,10 @@ onMounted(() => {
             <el-icon><Tools /></el-icon>
             <span>实用工具</span>
           </el-menu-item>
+          <el-menu-item index="toggles">
+            <el-icon><SetUp /></el-icon>
+            <span>快捷开关</span>
+          </el-menu-item>
         </el-menu>
       </el-aside>
 
@@ -131,6 +136,10 @@ onMounted(() => {
             />
             <ToolsPanel
               v-else-if="activeTab === 'tools'"
+              :selected-device="selectedDevice"
+            />
+            <QuickTogglesPanel
+              v-else-if="activeTab === 'toggles'"
               :selected-device="selectedDevice"
             />
           </KeepAlive>
@@ -271,7 +280,7 @@ html, body {
 
 .main-content {
   background: #f5f7fa;
-  padding: 20px;
+  padding: 20px 20px 40px;
   overflow-y: auto;
   height: 100%;
   overflow-x: hidden;

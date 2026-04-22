@@ -20,8 +20,8 @@ interface DeviceInfo {
   sdk_version: string;
   screen_resolution: string;
   density: string;
-  battery_level: string;
-  battery_status: string;
+  density_dpi: string;
+  smallest_width: string;
 }
 
 const props = defineProps<{
@@ -264,28 +264,23 @@ onBeforeUnmount(() => {
           <el-descriptions-item label="制造商">
             {{ deviceInfo.manufacturer }}
           </el-descriptions-item>
-          <el-descriptions-item label="序列号">
-            {{ deviceInfo.serial }}
-          </el-descriptions-item>
           <el-descriptions-item label="Android 版本">
             {{ deviceInfo.android_version }}
           </el-descriptions-item>
           <el-descriptions-item label="SDK 版本">
             {{ deviceInfo.sdk_version }}
           </el-descriptions-item>
+          <el-descriptions-item label="屏幕密度">
+            {{ deviceInfo.density || "-" }}
+          </el-descriptions-item>
+          <el-descriptions-item label="Smallest width dp">
+            {{ deviceInfo.smallest_width || "-" }}
+          </el-descriptions-item>
+          <el-descriptions-item label="densityDpi">
+            {{ deviceInfo.density_dpi || "-" }}
+          </el-descriptions-item>
           <el-descriptions-item label="屏幕分辨率">
             {{ deviceInfo.screen_resolution }}
-          </el-descriptions-item>
-          <el-descriptions-item label="屏幕密度">
-            {{ deviceInfo.density }}
-          </el-descriptions-item>
-          <el-descriptions-item label="电池电量">
-            <el-progress
-              :percentage="parseInt(deviceInfo.battery_level) || 0"
-              :status="
-                parseInt(deviceInfo.battery_level) > 20 ? 'success' : 'exception'
-              "
-            />
           </el-descriptions-item>
         </el-descriptions>
       </el-card>

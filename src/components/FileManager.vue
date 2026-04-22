@@ -348,8 +348,9 @@ watch(() => props.selectedDevice, loadFiles, { immediate: true });
       </div>
       <el-table
         :data="filteredApps"
+        class="fill-table"
         style="width: 100%"
-        height="calc(100vh - 300px)"
+        height="100%"
         @row-click="(row: AppInfo) => openAppData(row.package_name)"
       >
         <el-table-column prop="package_name" label="应用包名" min-width="300">
@@ -374,8 +375,9 @@ watch(() => props.selectedDevice, loadFiles, { immediate: true });
       v-else
       v-loading="loading"
       :data="files"
+      class="fill-table"
       style="width: 100%"
-      height="calc(100vh - 240px)"
+      height="100%"
       @row-click="(row: FileInfo) => row.is_dir && navigateTo(row.path)"
     >
       <el-table-column width="50">
@@ -425,6 +427,20 @@ watch(() => props.selectedDevice, loadFiles, { immediate: true });
 <style scoped>
 .file-manager {
   height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.fill-table {
+  flex: 1;
+  min-height: 0;
+}
+
+.apps-container {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .panel-header {
@@ -432,6 +448,7 @@ watch(() => props.selectedDevice, loadFiles, { immediate: true });
   justify-content: space-between;
   align-items: center;
   margin-bottom: 15px;
+  flex-shrink: 0;
 }
 
 .panel-header h2 {
@@ -448,6 +465,7 @@ watch(() => props.selectedDevice, loadFiles, { immediate: true });
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-shrink: 0;
 }
 
 .breadcrumb-label {
@@ -481,10 +499,6 @@ watch(() => props.selectedDevice, loadFiles, { immediate: true });
   text-decoration: underline;
 }
 
-.apps-container {
-  height: calc(100vh - 240px);
-}
-
 .apps-header {
   display: flex;
   justify-content: space-between;
@@ -492,6 +506,7 @@ watch(() => props.selectedDevice, loadFiles, { immediate: true });
   margin-bottom: 10px;
   color: #606266;
   font-size: 14px;
+  flex-shrink: 0;
 }
 
 .app-item {

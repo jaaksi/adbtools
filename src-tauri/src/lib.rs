@@ -36,8 +36,8 @@ pub struct DeviceInfo {
     pub sdk_version: String,
     pub screen_resolution: String,
     pub density: String,
-    pub battery_level: String,
-    pub battery_status: String,
+    pub density_dpi: String,
+    pub smallest_width: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -124,34 +124,28 @@ fn get_device_info(serial: &str) -> Result<DeviceInfo, String> {
     let android_version = get_prop("ro.build.version.release");
     let sdk_version = get_prop("ro.build.version.sdk");
 
+    // wm size / wm density 可能返回 "Physical ..." 和 "Override ..." 两行。
+    // 生效值以 Override 为准；没有 Override 时使用 Physical。
+    // smallest_width（dp）= 短边像素 × 160 / 生效 dpi，与开发者选项中的"最小宽度"一致。
     let screen_output = run_adb_command(&["-s", serial, "shell", "wm", "size"]).unwrap_or_default();
-    let screen_resolution = screen_output
-        .lines()
-        .next()
-        .and_then(|line| line.split(':').nth(1))
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
+    let (physical_size, override_size) = parse_wm_two_values(&screen_output);
+    let effective_size = override_size.clone().or_else(|| physical_size.clone());
+    let screen_resolution = effective_size.clone().unwrap_or_default();
 
     let density_output = run_adb_command(&["-s", serial, "shell", "wm", "density"]).unwrap_or_default();
-    let density = density_output
-        .lines()
-        .next()
-        .and_then(|line| line.split(':').nth(1))
-        .map(|s| s.trim().to_string())
+    let (physical_density, override_density) = parse_wm_two_values(&density_output);
+    let effective_density = override_density.clone().or_else(|| physical_density.clone());
+    let density_dpi = effective_density.clone().unwrap_or_default();
+    // density（比例）= densityDpi / 160，保留两位小数
+    let density = effective_density
+        .as_ref()
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .map(|dpi| format!("{:.2}", dpi / 160.0))
         .unwrap_or_default();
 
-    let battery_output = run_adb_command(&["-s", serial, "shell", "dumpsys", "battery"]).unwrap_or_default();
-    let mut battery_level = String::new();
-    let mut battery_status = String::new();
-
-    for line in battery_output.lines() {
-        if line.contains("level:") {
-            battery_level = line.split(':').nth(1).map(|s| s.trim().to_string()).unwrap_or_default();
-        }
-        if line.contains("status:") {
-            battery_status = line.split(':').nth(1).map(|s| s.trim().to_string()).unwrap_or_default();
-        }
-    }
+    let smallest_width = compute_smallest_width_dp(&effective_size, &effective_density)
+        .map(|dp| format!("{} dp", dp))
+        .unwrap_or_default();
 
     Ok(DeviceInfo {
         serial: serial.to_string(),
@@ -161,9 +155,40 @@ fn get_device_info(serial: &str) -> Result<DeviceInfo, String> {
         sdk_version,
         screen_resolution,
         density,
-        battery_level,
-        battery_status,
+        density_dpi,
+        smallest_width,
     })
+}
+
+// 解析 `wm size` / `wm density` 形如：
+//   "Physical size: 1080x2400\nOverride size: 1080x2400"
+// 返回 (physical_value, override_value)，都 trim 过且不含前缀
+fn parse_wm_two_values(output: &str) -> (Option<String>, Option<String>) {
+    let mut physical = None;
+    let mut override_v = None;
+    for line in output.lines() {
+        let trimmed = line.trim();
+        let value = trimmed.split(':').nth(1).map(|s| s.trim().to_string());
+        if trimmed.starts_with("Physical") {
+            physical = value;
+        } else if trimmed.starts_with("Override") {
+            override_v = value;
+        }
+    }
+    (physical, override_v)
+}
+
+// size 形如 "1080x2400"，density 形如 "446"，计算 sw_dp
+fn compute_smallest_width_dp(size: &Option<String>, density: &Option<String>) -> Option<u32> {
+    let size_str = size.as_ref()?;
+    let (w, h) = size_str.split_once('x')?;
+    let w: u32 = w.trim().parse().ok()?;
+    let h: u32 = h.trim().parse().ok()?;
+    let dpi: u32 = density.as_ref()?.trim().parse().ok()?;
+    if dpi == 0 {
+        return None;
+    }
+    Some(w.min(h) * 160 / dpi)
 }
 
 #[tauri::command]
@@ -985,6 +1010,150 @@ fn start_oauth_server(app: AppHandle, state: State<'_, OAuthState>) -> Result<u1
     Ok(port)
 }
 
+// ------------------ 快捷开关命令 ------------------
+
+// 将 "1"/"true" 视为 true，其它内容或命令失败时返回 false（不抛错）
+fn read_bool_setting(args: &[&str]) -> bool {
+    match run_adb_command(args) {
+        Ok(out) => {
+            let v = out.trim().to_ascii_lowercase();
+            v == "1" || v == "true"
+        }
+        Err(_) => false,
+    }
+}
+
+#[tauri::command]
+fn get_wifi_enabled(serial: &str) -> Result<bool, String> {
+    Ok(read_bool_setting(&[
+        "-s", serial, "shell", "settings", "get", "global", "wifi_on",
+    ]))
+}
+
+#[tauri::command]
+fn set_wifi_enabled(serial: &str, enabled: bool) -> Result<String, String> {
+    let action = if enabled { "enable" } else { "disable" };
+    run_adb_command(&["-s", serial, "shell", "svc", "wifi", action])
+}
+
+#[tauri::command]
+fn open_dev_options(serial: &str) -> Result<String, String> {
+    run_adb_command(&[
+        "-s", serial, "shell", "am", "start", "-a",
+        "android.settings.APPLICATION_DEVELOPMENT_SETTINGS",
+    ])
+}
+
+#[tauri::command]
+fn get_show_layout_bounds(serial: &str) -> Result<bool, String> {
+    Ok(read_bool_setting(&[
+        "-s", serial, "shell", "getprop", "debug.layout",
+    ]))
+}
+
+#[tauri::command]
+fn set_show_layout_bounds(serial: &str, enabled: bool) -> Result<String, String> {
+    let val = if enabled { "true" } else { "false" };
+    run_adb_command(&["-s", serial, "shell", "setprop", "debug.layout", val])?;
+    // service call activity 1599295570 让 WindowManager 立即重绘以生效
+    let _ = run_adb_command(&[
+        "-s", serial, "shell", "service", "call", "activity", "1599295570",
+    ]);
+    Ok("ok".to_string())
+}
+
+#[tauri::command]
+fn get_show_touches(serial: &str) -> Result<bool, String> {
+    Ok(read_bool_setting(&[
+        "-s", serial, "shell", "settings", "get", "system", "show_touches",
+    ]))
+}
+
+#[tauri::command]
+fn set_show_touches(serial: &str, enabled: bool) -> Result<String, String> {
+    let val = if enabled { "1" } else { "0" };
+    run_adb_command(&[
+        "-s", serial, "shell", "settings", "put", "system", "show_touches", val,
+    ])
+}
+
+#[tauri::command]
+fn get_pointer_location(serial: &str) -> Result<bool, String> {
+    Ok(read_bool_setting(&[
+        "-s", serial, "shell", "settings", "get", "system", "pointer_location",
+    ]))
+}
+
+#[tauri::command]
+fn set_pointer_location(serial: &str, enabled: bool) -> Result<String, String> {
+    let val = if enabled { "1" } else { "0" };
+    run_adb_command(&[
+        "-s", serial, "shell", "settings", "put", "system", "pointer_location", val,
+    ])
+}
+
+#[tauri::command]
+fn get_always_finish_activities(serial: &str) -> Result<bool, String> {
+    Ok(read_bool_setting(&[
+        "-s", serial, "shell", "settings", "get", "global", "always_finish_activities",
+    ]))
+}
+
+#[tauri::command]
+fn set_always_finish_activities(serial: &str, enabled: bool) -> Result<String, String> {
+    let val = if enabled { "1" } else { "0" };
+    run_adb_command(&[
+        "-s", serial, "shell", "settings", "put", "global", "always_finish_activities", val,
+    ])
+}
+
+// 暗黑模式：通过 `cmd uimode night yes/no` 切换，读取 `cmd uimode night` 输出形如 "Night mode: yes"
+#[tauri::command]
+fn get_dark_mode(serial: &str) -> Result<bool, String> {
+    match run_adb_command(&["-s", serial, "shell", "cmd", "uimode", "night"]) {
+        Ok(out) => {
+            let low = out.to_ascii_lowercase();
+            // 明确命中 "yes" 才返回 true；auto/no/unknown 都视为 false
+            Ok(low.contains("yes"))
+        }
+        Err(_) => Ok(false),
+    }
+}
+
+#[tauri::command]
+fn set_dark_mode(serial: &str, enabled: bool) -> Result<String, String> {
+    let val = if enabled { "yes" } else { "no" };
+    run_adb_command(&["-s", serial, "shell", "cmd", "uimode", "night", val])
+}
+
+// 导航模式：gestural / threebutton / twobutton
+// 读取 `settings get secure navigation_mode`：0=三按键，1=两按键，2=手势
+#[tauri::command]
+fn get_navigation_mode(serial: &str) -> Result<String, String> {
+    let out = run_adb_command(&[
+        "-s", serial, "shell", "settings", "get", "secure", "navigation_mode",
+    ])
+    .unwrap_or_default();
+    let mode = match out.trim() {
+        "2" => "gestural",
+        "1" => "twobutton",
+        "0" => "threebutton",
+        _ => "unknown",
+    };
+    Ok(mode.to_string())
+}
+
+#[tauri::command]
+fn set_navigation_mode(serial: &str, mode: &str) -> Result<String, String> {
+    let pkg = match mode {
+        "gestural" => "com.android.internal.systemui.navbar.gestural",
+        "threebutton" => "com.android.internal.systemui.navbar.threebutton",
+        "twobutton" => "com.android.internal.systemui.navbar.twobutton",
+        other => return Err(format!("未知的导航模式: {}", other)),
+    };
+    run_adb_command(&["-s", serial, "shell", "cmd", "overlay", "enable-exclusive", pkg])
+}
+
 const ADB_DOWNLOAD_URL: &str =
     "https://developer.android.com/tools/releases/platform-tools?hl=zh-cn";
 
@@ -1061,6 +1230,21 @@ pub fn run() {
             ensure_default_save_dir,
             start_oauth_server,
             fetch_image_as_data_url,
+            get_wifi_enabled,
+            set_wifi_enabled,
+            open_dev_options,
+            get_show_layout_bounds,
+            set_show_layout_bounds,
+            get_show_touches,
+            set_show_touches,
+            get_pointer_location,
+            set_pointer_location,
+            get_always_finish_activities,
+            set_always_finish_activities,
+            get_dark_mode,
+            set_dark_mode,
+            get_navigation_mode,
+            set_navigation_mode,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

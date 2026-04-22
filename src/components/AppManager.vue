@@ -27,7 +27,7 @@ const props = defineProps<{
 
 const apps = ref<AppInfo[]>([]);
 const loading = ref(false);
-const filter = ref("all");
+const filter = ref("third");
 const searchQuery = ref("");
 
 async function loadApps() {
@@ -175,6 +175,7 @@ watch(filter, loadApps);
           placeholder="搜索应用包名"
           style="width: 200px"
           :prefix-icon="Search"
+          clearable
         />
         <el-select v-model="filter" style="width: 120px">
           <el-option label="全部应用" value="all" />
@@ -196,8 +197,9 @@ watch(filter, loadApps);
       v-else
       v-loading="loading"
       :data="filteredApps"
+      class="fill-table"
       style="width: 100%"
-      height="calc(100vh - 200px)"
+      height="100%"
     >
       <el-table-column prop="package_name" label="包名" min-width="250" />
       <el-table-column label="类型" width="100">
@@ -237,6 +239,13 @@ watch(filter, loadApps);
 <style scoped>
 .app-manager {
   height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.fill-table {
+  flex: 1;
+  min-height: 0;
 }
 
 .panel-header {
@@ -244,6 +253,7 @@ watch(filter, loadApps);
   justify-content: space-between;
   align-items: center;
   margin-bottom: 20px;
+  flex-shrink: 0;
 }
 
 .panel-header h2 {
