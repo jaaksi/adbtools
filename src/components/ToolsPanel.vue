@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onBeforeUnmount } from "vue";
+import { ref, computed, watch, onBeforeUnmount } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { save } from "@tauri-apps/plugin-dialog";
@@ -13,6 +13,8 @@ import {
   Document,
   Search,
   Close,
+  CopyDocument,
+  Aim,
 } from "@element-plus/icons-vue";
 
 interface AppInfo {
@@ -32,6 +34,67 @@ const shellOutput = ref("");
 const shellLoading = ref(false);
 const screenshotLoading = ref(false);
 const exportLogLoading = ref(false);
+
+// 当前 Activity
+const topActivity = ref<string>("");
+const topActivityError = ref<string>("");
+const topActivityLoading = ref(false);
+const topActivityPolling = ref(false);
+let topActivityTimer: number | null = null;
+
+async function fetchTopActivity() {
+  if (!props.selectedDevice) return;
+  topActivityLoading.value = true;
+  try {
+    topActivity.value = await invoke<string>("get_top_activity", {
+      serial: props.selectedDevice,
+    });
+    topActivityError.value = "";
+  } catch (e) {
+    topActivityError.value = String(e);
+  } finally {
+    topActivityLoading.value = false;
+  }
+}
+
+function stopTopActivityPolling() {
+  if (topActivityTimer !== null) {
+    clearInterval(topActivityTimer);
+    topActivityTimer = null;
+  }
+}
+
+function onTopActivityPollingChange(v: boolean | string | number) {
+  topActivityPolling.value = Boolean(v);
+  stopTopActivityPolling();
+  if (topActivityPolling.value) {
+    fetchTopActivity();
+    topActivityTimer = window.setInterval(fetchTopActivity, 1000);
+  }
+}
+
+async function copyTopActivity() {
+  if (!topActivity.value) return;
+  try {
+    await navigator.clipboard.writeText(topActivity.value);
+    ElMessage.success("已复制到剪贴板");
+  } catch (e) {
+    ElMessage.error(`复制失败: ${e}`);
+  }
+}
+
+// 切换设备时：清空上一次结果并重置轮询
+watch(
+  () => props.selectedDevice,
+  () => {
+    topActivity.value = "";
+    topActivityError.value = "";
+    if (topActivityPolling.value) {
+      // 轮询保持开启，立即用新设备拉一次
+      fetchTopActivity();
+    }
+  }
+);
 
 // 日志导出 - 包名过滤
 const selectedLogPackage = ref("");
@@ -67,6 +130,15 @@ const recordElapsedText = computed(() => {
   const ss = String(s % 60).padStart(2, "0");
   return `${mm}:${ss}`;
 });
+
+// 文件名时间戳：格式 YYYYMMDDHHmmss（例如 20260422175730）
+function formatTimestamp(d: Date = new Date()): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return (
+    `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}` +
+    `${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`
+  );
+}
 
 // 保存目录：用过一次后记住，否则默认 ~/Documents/adbtools
 const LAST_SAVE_DIR_KEY = "adbtools:lastSaveDir";
@@ -123,7 +195,7 @@ async function takeScreenshot() {
   }
 
   const savePath = await save({
-    defaultPath: await resolveSaveDefault(`screenshot_${Date.now()}.png`),
+    defaultPath: await resolveSaveDefault(`screenshot_${formatTimestamp()}.png`),
     filters: [{ name: "PNG", extensions: ["png"] }],
   });
 
@@ -194,7 +266,7 @@ async function exportLogcat() {
   }
 
   const savePath = await save({
-    defaultPath: await resolveSaveDefault(`logcat_${Date.now()}.log`),
+    defaultPath: await resolveSaveDefault(`logcat_${formatTimestamp()}.log`),
     filters: [
       { name: "Log", extensions: ["log", "txt"] },
     ],
@@ -239,7 +311,7 @@ async function startScreenRecord() {
 
   // 开始前先让用户选好保存路径
   const savePath = await save({
-    defaultPath: await resolveSaveDefault(`screenrecord_${Date.now()}.mp4`),
+    defaultPath: await resolveSaveDefault(`screenrecord_${formatTimestamp()}.mp4`),
     filters: [{ name: "MP4", extensions: ["mp4"] }],
   });
   if (!savePath) return;
@@ -412,6 +484,7 @@ onBeforeUnmount(() => {
     clearInterval(recordTimer);
     recordTimer = null;
   }
+  stopTopActivityPolling();
 });
 </script>
 
@@ -557,6 +630,51 @@ onBeforeUnmount(() => {
           <el-button @click="loadApps" :loading="appPickerLoading">刷新</el-button>
         </template>
       </el-dialog>
+
+      <el-col :span="24" style="margin-top: 20px">
+        <el-card class="tool-card top-activity-card">
+          <template #header>
+            <div class="card-header">
+              <el-icon><Aim /></el-icon>
+              <span>当前 Activity</span>
+              <el-switch
+                v-model="topActivityPolling"
+                inline-prompt
+                active-text="轮询"
+                inactive-text="关闭"
+                @change="onTopActivityPollingChange"
+              />
+            </div>
+          </template>
+          <p class="tool-desc">
+            读取 dumpsys window 的 mCurrentFocus；开启轮询后每秒刷新一次
+          </p>
+          <div class="top-activity-row">
+            <el-input
+              :model-value="topActivity"
+              readonly
+              placeholder="点击「读取一次」或开启轮询"
+            />
+            <el-button
+              :icon="Aim"
+              :loading="topActivityLoading"
+              @click="fetchTopActivity"
+            >
+              读取一次
+            </el-button>
+            <el-button
+              :icon="CopyDocument"
+              :disabled="!topActivity"
+              @click="copyTopActivity"
+            >
+              复制
+            </el-button>
+          </div>
+          <p v-if="topActivityError" class="top-activity-error">
+            {{ topActivityError }}
+          </p>
+        </el-card>
+      </el-col>
 
       <el-col :span="24" style="margin-top: 20px">
         <el-card class="tool-card input-text-card">
@@ -752,6 +870,27 @@ onBeforeUnmount(() => {
   padding: 24px;
   text-align: center;
   color: var(--el-text-color-secondary);
+}
+
+.top-activity-card {
+  height: auto;
+}
+
+.top-activity-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.top-activity-row .el-input {
+  flex: 1;
+  font-family: "Courier New", monospace;
+}
+
+.top-activity-error {
+  margin: 10px 0 0;
+  color: var(--el-color-danger);
+  font-size: 12px;
 }
 
 .input-text-card {

@@ -508,6 +508,11 @@ fn parse_file_list(output: &str, base_path: &str) -> Result<Vec<FileInfo>, Strin
         if name.starts_with('.') {
             continue;
         }
+        // 跳过 Android 框架在应用 data 目录下自动生成的内部子目录（Context.getDir(name) → app_<name>），
+        // 例如 app_webview / app_textures / app_tmppccache 等，日常调试基本用不到
+        if name.starts_with("app_") {
+            continue;
+        }
 
         let permissions = parts[0].to_string();
         let is_dir = permissions.starts_with('d') || permissions.starts_with('l');
@@ -560,6 +565,205 @@ fn pull_file(serial: &str, remote_path: &str, local_path: &str) -> Result<String
 #[tauri::command]
 fn delete_file(serial: &str, remote_path: &str) -> Result<String, String> {
     run_adb_command(&["-s", serial, "shell", "rm", "-rf", remote_path])
+}
+
+// ---------- 文件预览：拉到本地临时目录 → 读取 → 返回内容 ----------
+
+#[derive(Debug, Serialize)]
+pub struct FilePreview {
+    pub kind: String,              // "text" | "image" | "binary"
+    pub mime: String,
+    pub size: u64,
+    pub text: Option<String>,      // kind == "text"
+    pub data_url: Option<String>,  // kind == "image"
+    pub temp_path: String,
+}
+
+const PREVIEW_MAX_BYTES: u64 = 5 * 1024 * 1024; // 5 MB
+
+fn preview_temp_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("adbtools-preview")
+}
+
+fn ext_lower(path: &str) -> String {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+fn is_text_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "txt" | "log" | "json" | "xml" | "html" | "htm" | "css" | "js" | "ts"
+            | "kt" | "java" | "md" | "properties" | "sh" | "conf" | "yaml" | "yml"
+            | "ini" | "toml"
+    )
+}
+
+fn image_mime(ext: &str) -> Option<&'static str> {
+    match ext {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "webp" => Some("image/webp"),
+        "gif" => Some("image/gif"),
+        "bmp" => Some("image/bmp"),
+        _ => None,
+    }
+}
+
+// 对无扩展或未知扩展的文件做内容嗅探：前 4KB 能解为 UTF-8 且不含过多控制字节 → 文本
+fn sniff_is_text(bytes: &[u8]) -> bool {
+    let probe = &bytes[..bytes.len().min(4096)];
+    if probe.is_empty() {
+        return true;
+    }
+    let s = match std::str::from_utf8(probe) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let total = s.chars().count() as f32;
+    if total == 0.0 {
+        return true;
+    }
+    let printable = s
+        .chars()
+        .filter(|c| !c.is_control() || matches!(*c, '\n' | '\r' | '\t'))
+        .count() as f32;
+    printable / total > 0.95
+}
+
+#[tauri::command]
+fn preview_remote_file(serial: &str, remote_path: &str) -> Result<FilePreview, String> {
+    let dir = preview_temp_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败: {}", e))?;
+
+    let original_name = std::path::Path::new(remote_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let temp_file = dir.join(format!("{}_{}", ts, original_name));
+    let temp_path_str = temp_file.to_string_lossy().to_string();
+
+    // 先尝试 adb pull
+    let pull_res = run_adb_command(&["-s", serial, "pull", remote_path, &temp_path_str]);
+
+    // 若 pull 失败且路径在 /data/data/ 下，走 run-as cat 回退
+    if let Err(err) = &pull_res {
+        let need_run_as = err.contains("Permission denied") || err.contains("does not exist")
+            || remote_path.starts_with("/data/data/");
+        if need_run_as && remote_path.starts_with("/data/data/") {
+            let after = &remote_path[11..];
+            let (pkg, rel) = match after.find('/') {
+                Some(i) => (&after[..i], &after[i + 1..]),
+                None => return Err(format!("adb pull 失败: {}", err)),
+            };
+            // 把 run-as cat 的原始字节写入本地临时文件
+            let output = Command::new("adb")
+                .args(["-s", serial, "shell", "run-as", pkg, "cat", rel])
+                .output()
+                .map_err(|e| format!("run-as cat 执行失败: {}", e))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("无法读取文件: {}", stderr));
+            }
+            // 注意：adb shell 会把输出里的 \n 转成 \r\n，二进制文件（如图片）会被破坏。
+            // 文本查看影响不大，这里尽量还原单个 \n。
+            let mut fixed = Vec::with_capacity(output.stdout.len());
+            let mut i = 0;
+            while i < output.stdout.len() {
+                let b = output.stdout[i];
+                if b == b'\r' && i + 1 < output.stdout.len() && output.stdout[i + 1] == b'\n' {
+                    fixed.push(b'\n');
+                    i += 2;
+                } else {
+                    fixed.push(b);
+                    i += 1;
+                }
+            }
+            std::fs::write(&temp_file, fixed)
+                .map_err(|e| format!("写入临时文件失败: {}", e))?;
+        } else {
+            return Err(format!("adb pull 失败: {}", err));
+        }
+    }
+
+    let meta = std::fs::metadata(&temp_file)
+        .map_err(|e| format!("读取临时文件元数据失败: {}", e))?;
+    let size = meta.len();
+    if size > PREVIEW_MAX_BYTES {
+        let _ = std::fs::remove_file(&temp_file);
+        return Err(format!(
+            "文件过大（{:.2} MB），超过 5 MB 上限，请下载后查看",
+            size as f64 / (1024.0 * 1024.0)
+        ));
+    }
+
+    let ext = ext_lower(original_name);
+
+    // 图片
+    if let Some(mime) = image_mime(&ext) {
+        use base64::{engine::general_purpose, Engine as _};
+        let bytes = std::fs::read(&temp_file).map_err(|e| format!("读取文件失败: {}", e))?;
+        let encoded = general_purpose::STANDARD.encode(&bytes);
+        return Ok(FilePreview {
+            kind: "image".into(),
+            mime: mime.into(),
+            size,
+            text: None,
+            data_url: Some(format!("data:{};base64,{}", mime, encoded)),
+            temp_path: temp_path_str,
+        });
+    }
+
+    // 文本（白名单或嗅探）
+    let bytes = std::fs::read(&temp_file).map_err(|e| format!("读取文件失败: {}", e))?;
+    let treat_as_text = is_text_ext(&ext) || (ext.is_empty() && sniff_is_text(&bytes));
+    if treat_as_text {
+        // 转 UTF-8；非法字节用 replace
+        let text = String::from_utf8_lossy(&bytes).to_string();
+        return Ok(FilePreview {
+            kind: "text".into(),
+            mime: "text/plain; charset=utf-8".into(),
+            size,
+            text: Some(text),
+            data_url: None,
+            temp_path: temp_path_str,
+        });
+    }
+
+    // 其它视为二进制
+    Ok(FilePreview {
+        kind: "binary".into(),
+        mime: "application/octet-stream".into(),
+        size,
+        text: None,
+        data_url: None,
+        temp_path: temp_path_str,
+    })
+}
+
+#[tauri::command]
+fn cleanup_preview_temp(temp_path: &str) -> Result<(), String> {
+    // 只允许删 adbtools-preview 目录下的文件，避免前端参数被篡改误删
+    let base = preview_temp_dir();
+    let target = std::path::PathBuf::from(temp_path);
+    if target.starts_with(&base) && target.exists() {
+        std::fs::remove_file(&target).map_err(|e| format!("删除临时文件失败: {}", e))?;
+    }
+    Ok(())
+}
+
+// 把预览临时文件另存到用户选择的位置（给浮层「下载到本地」按钮用）
+#[tauri::command]
+fn copy_local_file(src: &str, dest: &str) -> Result<(), String> {
+    std::fs::copy(src, dest).map_err(|e| format!("复制文件失败: {}", e))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1010,6 +1214,29 @@ fn start_oauth_server(app: AppHandle, state: State<'_, OAuthState>) -> Result<u1
     Ok(port)
 }
 
+// 通过 dumpsys window 的 mCurrentFocus 行提取当前最顶层 Activity（package/ComponentName）
+#[tauri::command]
+fn get_top_activity(serial: &str) -> Result<String, String> {
+    let out = run_adb_command(&["-s", serial, "shell", "dumpsys", "window"])?;
+    for line in out.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("mCurrentFocus=") {
+            // 形如：mCurrentFocus=Window{hash u0 pkg/.Activity}
+            // 取最后一个 '{' 与 '}' 之间的内容，再取最后一个空格后的 token
+            if let (Some(lb), Some(rb)) = (trimmed.rfind('{'), trimmed.rfind('}')) {
+                if rb > lb {
+                    let inner = &trimmed[lb + 1..rb];
+                    if let Some(token) = inner.split_whitespace().last() {
+                        return Ok(token.to_string());
+                    }
+                }
+            }
+            return Ok(trimmed.to_string());
+        }
+    }
+    Err("未能在 dumpsys window 中解析 mCurrentFocus".to_string())
+}
+
 // ------------------ 快捷开关命令 ------------------
 
 // 将 "1"/"true" 视为 true，其它内容或命令失败时返回 false（不抛错）
@@ -1245,6 +1472,10 @@ pub fn run() {
             set_dark_mode,
             get_navigation_mode,
             set_navigation_mode,
+            get_top_activity,
+            preview_remote_file,
+            cleanup_preview_temp,
+            copy_local_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

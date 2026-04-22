@@ -12,6 +12,10 @@ import {
   Delete,
   Search,
   Box,
+  View,
+  CopyDocument,
+  FolderOpened,
+  Close,
 } from "@element-plus/icons-vue";
 
 interface FileInfo {
@@ -43,6 +47,108 @@ const currentPath = ref("/data/data");
 const pathHistory = ref<string[]>([]);
 const isDataDataView = ref(false);
 const searchQuery = ref("");
+
+// ---- 文件预览浮层 ----
+interface FilePreview {
+  kind: "text" | "image" | "binary";
+  mime: string;
+  size: number;
+  text: string | null;
+  data_url: string | null;
+  temp_path: string;
+}
+
+const previewVisible = ref(false);
+const previewLoading = ref(false);
+const previewTarget = ref<FileInfo | null>(null);
+const preview = ref<FilePreview | null>(null);
+const previewError = ref("");
+
+async function openPreview(row: FileInfo) {
+  // 打开前先清理上一份临时副本
+  if (preview.value?.temp_path) {
+    try {
+      await invoke("cleanup_preview_temp", { tempPath: preview.value.temp_path });
+    } catch (e) {
+      console.warn("清理上次临时文件失败:", e);
+    }
+  }
+  previewTarget.value = row;
+  preview.value = null;
+  previewError.value = "";
+  previewVisible.value = true;
+  previewLoading.value = true;
+  try {
+    preview.value = await invoke<FilePreview>("preview_remote_file", {
+      serial: props.selectedDevice,
+      remotePath: row.path,
+    });
+  } catch (e) {
+    previewError.value = String(e);
+  } finally {
+    previewLoading.value = false;
+  }
+}
+
+async function onPreviewClosed() {
+  if (preview.value?.temp_path) {
+    try {
+      await invoke("cleanup_preview_temp", { tempPath: preview.value.temp_path });
+    } catch (e) {
+      console.warn("关闭浮层清理临时文件失败:", e);
+    }
+  }
+  preview.value = null;
+  previewTarget.value = null;
+  previewError.value = "";
+}
+
+async function copyPreviewText() {
+  if (!preview.value?.text) return;
+  try {
+    await navigator.clipboard.writeText(preview.value.text);
+    ElMessage.success("已复制到剪贴板");
+  } catch (e) {
+    ElMessage.error(`复制失败: ${e}`);
+  }
+}
+
+async function downloadFromPreview() {
+  if (!preview.value || !previewTarget.value) return;
+  const savePath = await save({
+    defaultPath: previewTarget.value.name,
+  });
+  if (!savePath) return;
+  try {
+    await invoke("copy_local_file", {
+      src: preview.value.temp_path,
+      dest: savePath,
+    });
+    ElMessage.success("已保存到本地");
+    try {
+      await invoke("reveal_in_folder", { path: savePath });
+    } catch (e) {
+      console.error("定位文件失败:", e);
+    }
+  } catch (e) {
+    ElMessage.error(`保存失败: ${e}`);
+  }
+}
+
+async function revealPreviewTemp() {
+  if (!preview.value?.temp_path) return;
+  try {
+    await invoke("reveal_in_folder", { path: preview.value.temp_path });
+  } catch (e) {
+    ElMessage.error(`定位临时文件失败: ${e}`);
+  }
+}
+
+function formatPreviewSize(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(2)} MB`;
+}
 
 // 从 localStorage 加载搜索记录
 onMounted(() => {
@@ -404,6 +510,14 @@ watch(() => props.selectedDevice, loadFiles, { immediate: true });
             <el-button
               v-if="!row.is_dir"
               size="small"
+              :icon="View"
+              @click.stop="openPreview(row)"
+            >
+              查看
+            </el-button>
+            <el-button
+              v-if="!row.is_dir"
+              size="small"
               :icon="Download"
               @click.stop="pullFile(row.path)"
             >
@@ -421,6 +535,66 @@ watch(() => props.selectedDevice, loadFiles, { immediate: true });
         </template>
       </el-table-column>
     </el-table>
+
+    <!-- 文件预览浮层 -->
+    <el-dialog
+      v-model="previewVisible"
+      :title="previewTarget ? `查看 · ${previewTarget.name}` : '查看'"
+      width="760px"
+      append-to-body
+      destroy-on-close
+      @closed="onPreviewClosed"
+    >
+      <div v-if="previewTarget" class="preview-path">{{ previewTarget.path }}</div>
+
+      <div v-loading="previewLoading" class="preview-body">
+        <el-alert
+          v-if="previewError"
+          type="error"
+          :closable="false"
+          show-icon
+          :title="previewError"
+        />
+        <template v-else-if="preview">
+          <div class="preview-meta">
+            {{ preview.mime }} · {{ formatPreviewSize(preview.size) }}
+          </div>
+          <pre v-if="preview.kind === 'text'" class="preview-text">{{ preview.text }}</pre>
+          <div v-else-if="preview.kind === 'image'" class="preview-image-wrap">
+            <img :src="preview.data_url || ''" class="preview-image" />
+          </div>
+          <el-empty
+            v-else
+            description="此文件为二进制，不支持在线预览"
+          />
+        </template>
+      </div>
+
+      <template #footer>
+        <el-button
+          v-if="preview?.kind === 'text'"
+          :icon="CopyDocument"
+          @click="copyPreviewText"
+        >
+          复制全文
+        </el-button>
+        <el-button
+          :icon="Download"
+          :disabled="!preview"
+          @click="downloadFromPreview"
+        >
+          下载到本地
+        </el-button>
+        <el-button
+          :icon="FolderOpened"
+          :disabled="!preview"
+          @click="revealPreviewTemp"
+        >
+          在访达中显示
+        </el-button>
+        <el-button :icon="Close" @click="previewVisible = false">关闭</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -434,6 +608,54 @@ watch(() => props.selectedDevice, loadFiles, { immediate: true });
 .fill-table {
   flex: 1;
   min-height: 0;
+}
+
+.preview-path {
+  font-family: "Courier New", monospace;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  margin-bottom: 8px;
+  word-break: break-all;
+}
+
+.preview-meta {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  margin-bottom: 8px;
+}
+
+.preview-body {
+  min-height: 120px;
+}
+
+.preview-text {
+  margin: 0;
+  max-height: 60vh;
+  overflow: auto;
+  padding: 12px;
+  background: #1e1e1e;
+  color: #d4d4d4;
+  font-family: "Courier New", monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
+  border-radius: 4px;
+}
+
+.preview-image-wrap {
+  text-align: center;
+  max-height: 60vh;
+  overflow: auto;
+  background: repeating-conic-gradient(#f5f5f5 0 25%, #fff 0 50%) 0 0 / 20px 20px;
+  padding: 12px;
+  border-radius: 4px;
+}
+
+.preview-image {
+  max-width: 100%;
+  max-height: 60vh;
+  object-fit: contain;
 }
 
 .apps-container {
