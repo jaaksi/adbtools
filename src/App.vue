@@ -113,24 +113,27 @@ onMounted(() => {
 
       <el-main class="main-content">
         <div class="main-body">
-          <DevicePanel 
-            v-if="activeTab === 'devices'" 
-            :devices="devices"
-            :selected-device="selectedDevice"
-            @refresh="refreshDevices"
-          />
-          <AppManager 
-            v-else-if="activeTab === 'apps'" 
-            :selected-device="selectedDevice"
-          />
-          <FileManager 
-            v-else-if="activeTab === 'files'" 
-            :selected-device="selectedDevice"
-          />
-          <ToolsPanel 
-            v-else-if="activeTab === 'tools'" 
-            :selected-device="selectedDevice"
-          />
+          <!-- 用 KeepAlive 缓存各面板，避免切 tab 时组件被销毁造成状态丢失（例如录屏中的计时器） -->
+          <KeepAlive>
+            <DevicePanel
+              v-if="activeTab === 'devices'"
+              :devices="devices"
+              :selected-device="selectedDevice"
+              @refresh="refreshDevices"
+            />
+            <AppManager
+              v-else-if="activeTab === 'apps'"
+              :selected-device="selectedDevice"
+            />
+            <FileManager
+              v-else-if="activeTab === 'files'"
+              :selected-device="selectedDevice"
+            />
+            <ToolsPanel
+              v-else-if="activeTab === 'tools'"
+              :selected-device="selectedDevice"
+            />
+          </KeepAlive>
         </div>
       </el-main>
     </el-container>

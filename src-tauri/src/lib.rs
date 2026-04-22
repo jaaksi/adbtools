@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::process::Command;
+use std::process::{Child, Command};
 use std::sync::mpsc::{channel, Sender, TryRecvError};
 use std::sync::Mutex;
 use std::thread;
@@ -9,6 +9,15 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, State};
 
 pub struct OAuthState(pub Mutex<Option<Sender<()>>>);
+
+// 录屏会话：保存本地 adb 子进程、设备序列号、远端文件路径
+pub struct RecordingSession {
+    pub child: Child,
+    pub serial: String,
+    pub remote_path: String,
+}
+
+pub struct RecordingState(pub Mutex<Option<RecordingSession>>);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Device {
@@ -174,7 +183,88 @@ fn disconnect_device(address: Option<&str>) -> Result<String, String> {
 
 #[tauri::command]
 fn install_apk(serial: &str, apk_path: &str) -> Result<String, String> {
-    run_adb_command(&["-s", serial, "install", "-r", apk_path])
+    // -r: 覆盖安装  -t: 允许安装 testOnly 标记的 APK（debug 包）
+    run_adb_command(&["-s", serial, "install", "-r", "-t", apk_path])
+}
+
+// 调用 aapt 解析 APK 的包名。先从 PATH 找，再尝试 ANDROID_HOME/build-tools 下最新版本
+#[tauri::command]
+fn get_apk_package_name(apk_path: &str) -> Result<String, String> {
+    let aapt_candidates = find_aapt_binaries();
+    if aapt_candidates.is_empty() {
+        return Err(
+            "未找到 aapt 工具。请安装 Android SDK Build Tools，或设置 ANDROID_HOME 环境变量。"
+                .to_string(),
+        );
+    }
+
+    for aapt in &aapt_candidates {
+        let result = Command::new(aapt)
+            .args(["dump", "badging", apk_path])
+            .output();
+        if let Ok(output) = result {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if let Some(pkg) = parse_package_from_aapt(&stdout) {
+                    return Ok(pkg);
+                }
+            }
+        }
+    }
+
+    Err("aapt 解析失败：未能从 APK 中提取 package 名".to_string())
+}
+
+fn parse_package_from_aapt(output: &str) -> Option<String> {
+    let line = output.lines().find(|l| l.starts_with("package:"))?;
+    let start = line.find("name='")? + 6;
+    let rest = &line[start..];
+    let end = rest.find('\'')?;
+    Some(rest[..end].to_string())
+}
+
+fn find_aapt_binaries() -> Vec<std::path::PathBuf> {
+    let mut list = Vec::new();
+
+    // 1. 先假定 aapt 在 PATH 中（Command 会自动走 PATH 查找）
+    list.push(std::path::PathBuf::from("aapt"));
+    list.push(std::path::PathBuf::from("aapt2"));
+
+    // 2. 扫描 ANDROID_HOME / ANDROID_SDK_ROOT / macOS 默认路径下的 build-tools
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(h) = std::env::var("ANDROID_HOME") {
+        roots.push(h.into());
+    }
+    if let Ok(h) = std::env::var("ANDROID_SDK_ROOT") {
+        roots.push(h.into());
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        roots.push(std::path::Path::new(&home).join("Library/Android/sdk"));
+    }
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        roots.push(std::path::Path::new(&local).join("Android/Sdk"));
+    }
+
+    for root in roots {
+        let bt = root.join("build-tools");
+        if let Ok(entries) = std::fs::read_dir(&bt) {
+            let mut versions: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+            versions.sort_by_key(|e| e.file_name()); // 字符串升序，最后一个通常是最新版
+            if let Some(latest) = versions.last() {
+                let p = latest.path();
+                let aapt = p.join(if cfg!(windows) { "aapt.exe" } else { "aapt" });
+                if aapt.exists() {
+                    list.push(aapt);
+                }
+                let aapt2 = p.join(if cfg!(windows) { "aapt2.exe" } else { "aapt2" });
+                if aapt2.exists() {
+                    list.push(aapt2);
+                }
+            }
+        }
+    }
+
+    list
 }
 
 #[tauri::command]
@@ -224,11 +314,24 @@ fn get_installed_apps(serial: &str, filter: Option<&str>) -> Result<Vec<AppInfo>
 
 #[tauri::command]
 fn start_app(serial: &str, package_name: &str, activity: Option<&str>) -> Result<String, String> {
-    let component = match activity {
-        Some(act) => format!("{}/{}", package_name, act),
-        None => format!("{}/.MainActivity", package_name),
-    };
-    run_adb_command(&["-s", serial, "shell", "am", "start", "-n", &component])
+    // 若指定了 activity，仍然用 am start -n；否则用 monkey 让系统自动解析 LAUNCHER Activity，
+    // 这样无论启动页是 SplashActivity 还是别的名字都能正确打开。
+    if let Some(act) = activity {
+        let component = format!("{}/{}", package_name, act);
+        return run_adb_command(&["-s", serial, "shell", "am", "start", "-n", &component]);
+    }
+
+    run_adb_command(&[
+        "-s",
+        serial,
+        "shell",
+        "monkey",
+        "-p",
+        package_name,
+        "-c",
+        "android.intent.category.LAUNCHER",
+        "1",
+    ])
 }
 
 #[tauri::command]
@@ -444,17 +547,197 @@ fn take_screenshot(serial: &str, save_path: &str) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn start_screen_record(serial: &str, save_path: &str, duration: Option<u32>) -> Result<String, String> {
-    let time_limit = duration.unwrap_or(30);
-    let temp_path = "/sdcard/screenrecord.mp4";
-    run_adb_command(&[
-        "-s", serial, "shell", "screenrecord", 
-        "--time-limit", &time_limit.to_string(),
-        temp_path
-    ])?;
-    run_adb_command(&["-s", serial, "pull", temp_path, save_path])?;
-    run_adb_command(&["-s", serial, "shell", "rm", temp_path])?;
+fn start_screen_record(serial: String, state: State<'_, RecordingState>) -> Result<String, String> {
+    let mut guard = state.0.lock().map_err(|e| e.to_string())?;
+
+    // 若已有会话，检查子进程是否仍存活：已退出则视为残留，直接回收
+    if let Some(session) = guard.as_mut() {
+        match session.child.try_wait() {
+            Ok(Some(_)) | Err(_) => {
+                guard.take();
+            }
+            Ok(None) => {
+                return Err("已有录屏任务正在进行".to_string());
+            }
+        }
+    }
+
+    // 兜底：把设备端可能残留的 screenrecord 先干掉（例如上次进程崩溃留下的孤儿）
+    let _ = run_adb_command(&[
+        "-s", &serial, "shell", "pkill", "-SIGINT", "screenrecord",
+    ]);
+    thread::sleep(Duration::from_millis(200));
+
+    // 使用时间戳生成唯一文件名，避免多次录制冲突
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let remote_path = format!("/sdcard/screenrecord_{}.mp4", ts);
+
+    eprintln!(
+        "ADB command (spawn): adb -s {} shell screenrecord {}",
+        serial, remote_path
+    );
+
+    // 以子进程方式启动 screenrecord（该命令会阻塞直到录制结束或收到信号）
+    let child = Command::new("adb")
+        .args(&["-s", &serial, "shell", "screenrecord", &remote_path])
+        .spawn()
+        .map_err(|e| format!("启动录屏失败: {}", e))?;
+
+    *guard = Some(RecordingSession {
+        child,
+        serial,
+        remote_path: remote_path.clone(),
+    });
+
+    Ok(remote_path)
+}
+
+// 通过 `pidof screenrecord` 查询设备端是否真的还在录屏
+#[tauri::command]
+fn is_screen_recording(serial: &str) -> Result<bool, String> {
+    match run_adb_command(&["-s", serial, "shell", "pidof", "screenrecord"]) {
+        Ok(s) => Ok(!s.trim().is_empty()),
+        // pidof 找不到进程时返回非零退出码，run_adb_command 视为 Err
+        Err(_) => Ok(false),
+    }
+}
+
+#[tauri::command]
+fn cancel_screen_record(state: State<'_, RecordingState>) -> Result<(), String> {
+    let session = {
+        let mut guard = state.0.lock().map_err(|e| e.to_string())?;
+        guard.take()
+    };
+
+    if let Some(mut s) = session {
+        // 优雅终止设备端 screenrecord
+        let _ = run_adb_command(&[
+            "-s", &s.serial, "shell", "pkill", "-SIGINT", "screenrecord",
+        ]);
+        // 本地 adb 子进程也强杀
+        let _ = s.child.kill();
+        let _ = s.child.wait();
+        // 清理设备上可能已生成的临时文件
+        let _ = run_adb_command(&["-s", &s.serial, "shell", "rm", "-f", &s.remote_path]);
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn stop_screen_record(save_path: String, state: State<'_, RecordingState>) -> Result<String, String> {
+    let session = {
+        let mut guard = state.0.lock().map_err(|e| e.to_string())?;
+        guard.take().ok_or_else(|| "当前没有录屏任务".to_string())?
+    };
+
+    let RecordingSession {
+        mut child,
+        serial,
+        remote_path,
+    } = session;
+
+    // 通过 adb 给设备上的 screenrecord 进程发送 SIGINT，让其优雅结束并写完文件头尾
+    let _ = run_adb_command(&[
+        "-s", &serial, "shell", "pkill", "-SIGINT", "screenrecord",
+    ]);
+
+    // 等待本地 adb 子进程退出（最多等 5 秒，超时则强杀）
+    // 子进程退出即意味着设备端 screenrecord 已完成 MP4 尾部写入，文件可安全拉取
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                thread::sleep(Duration::from_millis(30));
+            }
+            Err(_) => break,
+        }
+    }
+
+    // 拉取到本地
+    run_adb_command(&["-s", &serial, "pull", &remote_path, &save_path])?;
+
+    // 清理远端文件
+    let _ = run_adb_command(&["-s", &serial, "shell", "rm", &remote_path]);
+
     Ok("Screen recording saved successfully".to_string())
+}
+
+// 导出设备日志到本地文件（adb logcat -d 获取全部缓冲区快照）
+// buffers: 可选，形如 "main,system,crash"，默认使用 "all"
+// package: 可选包名，若指定则通过 pidof 取 PID，再按 threadtime 格式过滤 PID 列
+#[tauri::command]
+fn export_logcat(
+    serial: &str,
+    save_path: &str,
+    buffers: Option<&str>,
+    package: Option<&str>,
+) -> Result<String, String> {
+    let buffer_arg = buffers.unwrap_or("all");
+    let filter_pkg = package.map(|s| s.trim()).filter(|s| !s.is_empty());
+
+    // 按包名过滤时：通过 `pidof` 拿到所有进程 PID（多进程应用可能有多个）
+    let pids: Vec<String> = if let Some(pkg) = filter_pkg {
+        let out = run_adb_command(&["-s", serial, "shell", "pidof", pkg]).unwrap_or_default();
+        out.split_whitespace().map(|s| s.to_string()).collect()
+    } else {
+        Vec::new()
+    };
+
+    if let Some(pkg) = filter_pkg {
+        if pids.is_empty() {
+            return Err(format!(
+                "未找到应用 {} 的进程，请先在设备上启动该应用后再导出",
+                pkg
+            ));
+        }
+    }
+
+    eprintln!(
+        "ADB command: adb -s {} logcat -d -b {} -v threadtime (filter pkg={:?}, pids={:?})",
+        serial, buffer_arg, filter_pkg, pids
+    );
+    let output = Command::new("adb")
+        .args(["-s", serial, "logcat", "-d", "-b", buffer_arg, "-v", "threadtime"])
+        .output()
+        .map_err(|e| format!("执行 adb logcat 失败: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        return Err(format!("导出日志失败: {}", stderr));
+    }
+
+    // threadtime 格式： "MM-DD HH:MM:SS.mmm  PID  TID LEVEL TAG: MSG"
+    // 按空白分割后，索引 2 是 PID
+    let bytes: Vec<u8> = if pids.is_empty() {
+        output.stdout
+    } else {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let pid_set: std::collections::HashSet<&str> =
+            pids.iter().map(|s| s.as_str()).collect();
+        let mut filtered = String::new();
+        for line in stdout.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 3 && pid_set.contains(parts[2]) {
+                filtered.push_str(line);
+                filtered.push('\n');
+            }
+        }
+        filtered.into_bytes()
+    };
+
+    std::fs::write(save_path, &bytes).map_err(|e| format!("写入日志文件失败: {}", e))?;
+
+    Ok(format!("日志已保存（{} 字节）", bytes.len()))
 }
 
 #[tauri::command]
@@ -466,6 +749,39 @@ fn reboot_device(serial: &str, mode: Option<&str>) -> Result<String, String> {
     }
 }
 
+// 将文本输入到设备当前焦点的输入框（封装 `adb shell input text`）
+#[tauri::command]
+fn input_text(serial: &str, text: &str) -> Result<String, String> {
+    if text.is_empty() {
+        return Err("文本不能为空".to_string());
+    }
+    // `input text` 仅支持 ASCII；非 ASCII（含中文）需要 ADBKeyBoard 等第三方输入法支持
+    if !text.is_ascii() {
+        return Err(
+            "adb shell input text 不支持中文/非 ASCII 字符。\n\
+             如需输入中文，请在设备安装 ADBKeyBoard 并切换为默认输入法。"
+                .to_string(),
+        );
+    }
+
+    // 空格需要转成 %s；shell 元字符需转义，否则会被设备端 shell 解释
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            ' ' => escaped.push_str("%s"),
+            '"' | '\'' | '`' | '$' | '\\' | '&' | ';' | '|' | '*' | '<' | '>' | '?' | '#'
+            | '(' | ')' | '!' | '~' => {
+                escaped.push('\\');
+                escaped.push(c);
+            }
+            _ => escaped.push(c),
+        }
+    }
+
+    run_adb_command(&["-s", serial, "shell", "input", "text", &escaped])?;
+    Ok("文本已发送".to_string())
+}
+
 #[tauri::command]
 fn run_shell_command(serial: &str, command: &str) -> Result<String, String> {
     let args: Vec<&str> = command.split_whitespace().collect();
@@ -474,8 +790,57 @@ fn run_shell_command(serial: &str, command: &str) -> Result<String, String> {
     run_adb_command(&cmd_args)
 }
 
+// 返回 ~/Documents/adbtools，若不存在则创建
 #[tauri::command]
-fn open_url(url: &str) -> Result<(), String> {
+fn ensure_default_save_dir() -> Result<String, String> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map_err(|_| "无法获取用户主目录".to_string())?;
+    let dir = std::path::Path::new(&home)
+        .join("Documents")
+        .join("adbtools");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {}", e))?;
+    Ok(dir.to_string_lossy().to_string())
+}
+
+// 在系统文件管理器中打开并高亮指定文件
+#[tauri::command]
+fn reveal_in_folder(path: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .args(["-R", path])
+            .spawn()
+            .map_err(|e| format!("打开 Finder 失败: {}", e))?;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // /select, 后面直接跟路径（不加引号，Command 会处理转义）
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{}", path))
+            .spawn()
+            .map_err(|e| format!("打开 Explorer 失败: {}", e))?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Linux 绝大多数文件管理器不支持 reveal，退回到打开父目录
+        let parent = std::path::Path::new(path)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string());
+        std::process::Command::new("xdg-open")
+            .arg(parent)
+            .spawn()
+            .map_err(|e| format!("打开文件管理器失败: {}", e))?;
+    }
+
+    Ok(())
+}
+
+// 使用系统默认方式打开 URL（macOS open / Windows start / Linux xdg-open）
+fn open_url_native(url: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open")
@@ -483,7 +848,7 @@ fn open_url(url: &str) -> Result<(), String> {
             .spawn()
             .map_err(|e| format!("Failed to open URL: {}", e))?;
     }
-    
+
     #[cfg(target_os = "windows")]
     {
         std::process::Command::new("cmd")
@@ -491,7 +856,7 @@ fn open_url(url: &str) -> Result<(), String> {
             .spawn()
             .map_err(|e| format!("Failed to open URL: {}", e))?;
     }
-    
+
     #[cfg(target_os = "linux")]
     {
         std::process::Command::new("xdg-open")
@@ -499,8 +864,13 @@ fn open_url(url: &str) -> Result<(), String> {
             .spawn()
             .map_err(|e| format!("Failed to open URL: {}", e))?;
     }
-    
+
     Ok(())
+}
+
+#[tauri::command]
+fn open_url(url: &str) -> Result<(), String> {
+    open_url_native(url)
 }
 
 // 后端代理下载图片，返回 data URL（用于绕开 webview 请求头导致的 429 等问题）
@@ -615,18 +985,56 @@ fn start_oauth_server(app: AppHandle, state: State<'_, OAuthState>) -> Result<u1
     Ok(port)
 }
 
+const ADB_DOWNLOAD_URL: &str =
+    "https://developer.android.com/tools/releases/platform-tools?hl=zh-cn";
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    use tauri::menu::{Menu, MenuItem, MenuItemKind};
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(OAuthState(Mutex::new(None)))
+        .manage(RecordingState(Mutex::new(None)))
+        .menu(|handle| {
+            // 在系统默认菜单的 Help 子菜单里追加"下载 ADB"
+            let menu = Menu::default(handle)?;
+            let download_item = MenuItem::with_id(
+                handle,
+                "download_adb",
+                "下载 ADB",
+                true,
+                None::<&str>,
+            )?;
+
+            for item in menu.items()? {
+                if let MenuItemKind::Submenu(sm) = item {
+                    if let Ok(text) = sm.text() {
+                        if text == "Help" || text == "帮助" {
+                            sm.append(&download_item)?;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            Ok(menu)
+        })
+        .on_menu_event(|_app, event| {
+            if event.id() == "download_adb" {
+                if let Err(e) = open_url_native(ADB_DOWNLOAD_URL) {
+                    eprintln!("打开下载页失败: {}", e);
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             get_devices,
             get_device_info,
             connect_device,
             disconnect_device,
             install_apk,
+            get_apk_package_name,
             uninstall_app,
             get_installed_apps,
             list_data_apps,
@@ -640,10 +1048,17 @@ pub fn run() {
             pull_file,
             delete_file,
             take_screenshot,
+            export_logcat,
             start_screen_record,
+            stop_screen_record,
+            cancel_screen_record,
+            is_screen_recording,
             reboot_device,
             run_shell_command,
+            input_text,
             open_url,
+            reveal_in_folder,
+            ensure_default_save_dir,
             start_oauth_server,
             fetch_image_as_data_url,
         ])
