@@ -58,6 +58,13 @@ async function handleVersionDowngrade(
   }
 
   const pkgHint = packageName ? `（${packageName}）` : "";
+
+  // 弹确认框前先关闭遮罩，否则 z-index 会把 MessageBox 整个盖住，
+  // 用户看不到也点不到，流程会永远卡在这里
+  const wasInstalling = installing.value;
+  installing.value = false;
+
+  let confirmed = false;
   try {
     await ElMessageBox.confirm(
       `设备上已安装更高版本的 ${fileName}${pkgHint}。\n\n继续需要先卸载该应用，此操作会清空应用数据，是否继续？`,
@@ -69,9 +76,15 @@ async function handleVersionDowngrade(
         distinguishCancelAndClose: true,
       }
     );
+    confirmed = true;
   } catch {
-    return "cancelled";
+    // 用户点取消/关闭/ESC
+  } finally {
+    // 继续后续流程（成功/失败/取消都）恢复之前的遮罩状态
+    installing.value = wasInstalling;
   }
+
+  if (!confirmed) return "cancelled";
 
   if (!packageName) {
     ElMessage.error(
