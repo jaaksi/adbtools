@@ -4,7 +4,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { ElMessage } from "element-plus";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import {
-  ArrowUp,
   ArrowLeft,
   Upload,
   Refresh,
@@ -65,6 +64,157 @@ interface FilePreview {
   temp_path: string;
 }
 
+interface SqliteView {
+  absolutePath: string; // 展示用
+  package: string;
+  relativePath: string; // run-as 下相对 app data 根的相对路径
+  tables: string[];
+  currentTable: string;
+  columns: string[];
+  rows: string[][];
+  loadingTables: boolean;
+  loadingRows: boolean;
+  limit: number;
+  offset: number;
+  search: string;
+  error: string;
+}
+
+const sqliteView = ref<SqliteView | null>(null);
+const SQLITE_EXTS = ["db", "sqlite", "sqlite3"];
+
+function isSqliteFile(name: string): boolean {
+  const ext = name.toLowerCase().split(".").pop() ?? "";
+  return SQLITE_EXTS.includes(ext);
+}
+
+// 从 currentPath + row 推出 run-as 需要的 (pkg, 相对路径)
+function resolvePackageAndRel(rowPath: string): { pkg: string; rel: string } | null {
+  const abs = resolveRemotePath(rowPath);
+  if (!abs.startsWith("/data/data/")) return null;
+  const after = abs.substring(11);
+  const slashIdx = after.indexOf("/");
+  if (slashIdx === -1) return null;
+  const pkg = after.substring(0, slashIdx);
+  const rel = after.substring(slashIdx + 1);
+  return { pkg, rel };
+}
+
+async function openSqliteView(row: FileInfo) {
+  const info = resolvePackageAndRel(row.path);
+  if (!info) {
+    ElMessage.error("只能查看调试应用 data 目录下的数据库");
+    return;
+  }
+  previewTarget.value = row;
+  preview.value = null;
+  previewError.value = "";
+  spSearch.value = "";
+  previewVisible.value = true;
+  sqliteView.value = {
+    absolutePath: resolveRemotePath(row.path),
+    package: info.pkg,
+    relativePath: info.rel,
+    tables: [],
+    currentTable: "",
+    columns: [],
+    rows: [],
+    loadingTables: true,
+    loadingRows: false,
+    limit: 100,
+    offset: 0,
+    search: "",
+    error: "",
+  };
+  try {
+    const tables = await invoke<string[]>("sqlite_list_tables", {
+      serial: props.selectedDevice,
+      package: info.pkg,
+      dbPath: info.rel,
+    });
+    if (!sqliteView.value) return;
+    sqliteView.value.tables = tables;
+    if (tables.length > 0) {
+      await loadSqliteTable(tables[0]);
+    }
+  } catch (e) {
+    if (sqliteView.value) sqliteView.value.error = String(e);
+  } finally {
+    if (sqliteView.value) sqliteView.value.loadingTables = false;
+  }
+}
+
+async function loadSqliteTable(table: string) {
+  if (!sqliteView.value) return;
+  sqliteView.value.currentTable = table;
+  sqliteView.value.offset = 0;
+  sqliteView.value.search = "";
+  await queryCurrentSqliteTable();
+}
+
+function onSqliteSearchChange() {
+  if (!sqliteView.value) return;
+  sqliteView.value.offset = 0;
+  queryCurrentSqliteTable();
+}
+
+async function queryCurrentSqliteTable() {
+  if (!sqliteView.value || !sqliteView.value.currentTable) return;
+  sqliteView.value.loadingRows = true;
+  sqliteView.value.error = "";
+  try {
+    const res = await invoke<{ columns: string[]; rows: string[][] }>(
+      "sqlite_query_table",
+      {
+        serial: props.selectedDevice,
+        package: sqliteView.value.package,
+        dbPath: sqliteView.value.relativePath,
+        table: sqliteView.value.currentTable,
+        limit: sqliteView.value.limit,
+        offset: sqliteView.value.offset,
+        search: sqliteView.value.search || null,
+      }
+    );
+    sqliteView.value.columns = res.columns;
+    sqliteView.value.rows = res.rows;
+  } catch (e) {
+    sqliteView.value.error = String(e);
+    sqliteView.value.columns = [];
+    sqliteView.value.rows = [];
+  } finally {
+    sqliteView.value.loadingRows = false;
+  }
+}
+
+function sqlitePageNext() {
+  if (!sqliteView.value) return;
+  sqliteView.value.offset += sqliteView.value.limit;
+  queryCurrentSqliteTable();
+}
+
+function sqlitePagePrev() {
+  if (!sqliteView.value) return;
+  sqliteView.value.offset = Math.max(0, sqliteView.value.offset - sqliteView.value.limit);
+  queryCurrentSqliteTable();
+}
+
+// 双击单元格复制字段值
+async function onSqliteCellDblClick(
+  _row: string[],
+  column: { property?: string }
+) {
+  if (!sqliteView.value || !column?.property) return;
+  const idx = parseInt(column.property, 10);
+  if (!Number.isInteger(idx)) return;
+  const value = _row[idx] ?? "";
+  try {
+    await navigator.clipboard.writeText(value);
+    ElMessage.success(`已复制${value ? "" : "（空值）"}`);
+  } catch (e) {
+    ElMessage.error(`复制失败: ${e}`);
+  }
+}
+
 const previewVisible = ref(false);
 const previewLoading = ref(false);
 const previewTarget = ref<FileInfo | null>(null);
@@ -72,6 +222,11 @@ const preview = ref<FilePreview | null>(null);
 const previewError = ref("");
 
 async function openPreview(row: FileInfo) {
+  // SQLite 数据库走独立流程（设备端 sqlite3）
+  if (isSqliteFile(row.name)) {
+    await openSqliteView(row);
+    return;
+  }
   // 打开前先清理上一份临时副本
   if (preview.value?.temp_path) {
     try {
@@ -80,6 +235,7 @@ async function openPreview(row: FileInfo) {
       console.warn("清理上次临时文件失败:", e);
     }
   }
+  sqliteView.value = null;
   previewTarget.value = row;
   preview.value = null;
   previewError.value = "";
@@ -107,6 +263,7 @@ async function onPreviewClosed() {
     }
   }
   preview.value = null;
+  sqliteView.value = null;
   previewTarget.value = null;
   previewError.value = "";
 }
@@ -349,8 +506,15 @@ async function loadFiles() {
     }
   } catch (error) {
     console.error("Failed to list files:", currentPath.value, error);
+    const msg = String(error);
     ElMessage.error(`获取文件列表失败：${error}`);
     files.value = [];
+    // 路径不存在 → 自动回退一级，避免用户卡在坏路径无法离开
+    if (/No such file or directory|does not exist/i.test(msg) && pathHistory.value.length > 0) {
+      const prev = pathHistory.value.pop()!;
+      currentPath.value = prev;
+      // 不再递归 loadFiles，防止上一层同样坏导致死循环
+    }
   } finally {
     loading.value = false;
   }
@@ -396,36 +560,6 @@ function navigateBack() {
   }
 }
 
-function navigateUp() {
-  if (currentPath.value === "/") return;
-  
-  if (currentPath.value === "/data/data") {
-    navigateTo("/sdcard");
-    return;
-  }
-  
-  if (currentPath.value.startsWith("/data/data/")) {
-    const afterData = currentPath.value.substring(11);
-    const slashIdx = afterData.indexOf('/');
-    if (slashIdx !== -1) {
-      const packageName = afterData.substring(0, slashIdx);
-      const subPath = afterData.substring(slashIdx + 1);
-      const parentSubPath = subPath.split('/').slice(0, -1).join('/');
-      currentPath.value = `/data/data/${packageName}${parentSubPath ? '/' + parentSubPath : ''}`;
-      navigateTo(currentPath.value);
-      return;
-    }
-  }
-  
-  const parts = currentPath.value.split("/").filter(p => p !== "");
-  if (parts.length <= 1) {
-    currentPath.value = "/";
-  } else {
-    parts.pop();
-    currentPath.value = "/" + parts.join("/");
-  }
-  navigateTo(currentPath.value);
-}
 
 async function openAppData(packageName: string) {
   pathHistory.value.push(currentPath.value);
@@ -511,9 +645,6 @@ watch(() => props.selectedDevice, loadFiles, { immediate: true });
     <div class="panel-header">
       <h2>文件管理</h2>
       <div class="header-actions">
-        <el-button :icon="ArrowUp" @click="navigateUp" :disabled="currentPath === '/'">
-          上级目录
-        </el-button>
         <el-button :icon="ArrowLeft" @click="navigateBack" :disabled="pathHistory.length === 0">
           返回
         </el-button>
@@ -659,7 +790,104 @@ watch(() => props.selectedDevice, loadFiles, { immediate: true });
     >
       <div v-if="previewTarget" class="preview-path">{{ previewTarget.path }}</div>
 
-      <div v-loading="previewLoading" class="preview-body">
+      <div
+        v-if="sqliteView"
+        v-loading="sqliteView.loadingTables"
+        class="preview-body preview-sqlite"
+      >
+        <el-alert
+          v-if="sqliteView.error"
+          type="error"
+          :closable="false"
+          show-icon
+          :title="sqliteView.error"
+        />
+        <template v-else>
+          <div class="sqlite-toolbar">
+            <span class="sqlite-label">表</span>
+            <el-select
+              v-model="sqliteView.currentTable"
+              :disabled="sqliteView.loadingTables || sqliteView.tables.length === 0"
+              placeholder="选择表"
+              style="width: 260px"
+              @change="loadSqliteTable"
+            >
+              <el-option
+                v-for="t in sqliteView.tables"
+                :key="t"
+                :label="t"
+                :value="t"
+              />
+            </el-select>
+            <span class="sqlite-meta">
+              共 {{ sqliteView.tables.length }} 张表
+            </span>
+          </div>
+          <div class="sqlite-toolbar">
+            <el-input
+              v-model="sqliteView.search"
+              :placeholder="`按首列${sqliteView.columns[0] ? '「' + sqliteView.columns[0] + '」' : ''}搜索`"
+              clearable
+              :prefix-icon="Search"
+              style="width: 280px"
+              @keyup.enter="onSqliteSearchChange"
+              @clear="onSqliteSearchChange"
+            />
+            <el-button
+              size="small"
+              type="primary"
+              :disabled="sqliteView.loadingRows"
+              @click="onSqliteSearchChange"
+            >
+              搜索
+            </el-button>
+          </div>
+          <div class="sqlite-toolbar">
+            <el-button
+              size="small"
+              :disabled="sqliteView.offset === 0 || sqliteView.loadingRows"
+              @click="sqlitePagePrev"
+            >
+              上一页
+            </el-button>
+            <span class="sqlite-meta">
+              第 {{ Math.floor(sqliteView.offset / sqliteView.limit) + 1 }} 页 · 每页
+              {{ sqliteView.limit }} 条 · 当前 {{ sqliteView.rows.length }} 行
+            </span>
+            <el-button
+              size="small"
+              :disabled="sqliteView.rows.length < sqliteView.limit || sqliteView.loadingRows"
+              @click="sqlitePageNext"
+            >
+              下一页
+            </el-button>
+          </div>
+          <el-table
+            v-loading="sqliteView.loadingRows"
+            :data="sqliteView.rows"
+            size="small"
+            stripe
+            border
+            empty-text="该表没有数据"
+            max-height="calc(88vh - 280px)"
+            class="sqlite-rows-table"
+            @cell-dblclick="onSqliteCellDblClick"
+          >
+            <el-table-column
+              v-for="(col, idx) in sqliteView.columns"
+              :key="col"
+              :prop="`${idx}`"
+              :label="col"
+              min-width="140"
+              show-overflow-tooltip
+            >
+              <template #default="{ row }">{{ row[idx] }}</template>
+            </el-table-column>
+          </el-table>
+        </template>
+      </div>
+
+      <div v-else v-loading="previewLoading" class="preview-body">
         <el-alert
           v-if="previewError"
           type="error"
@@ -777,6 +1005,35 @@ watch(() => props.selectedDevice, loadFiles, { immediate: true });
 
 .sp-search {
   margin-bottom: 8px;
+}
+
+.preview-sqlite {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.sqlite-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.sqlite-label {
+  font-size: 13px;
+  color: var(--el-text-color-regular);
+}
+
+.sqlite-meta {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+
+/* 数据行暗示可点击（双击复制） */
+:deep(.sqlite-rows-table) .el-table__row td {
+  user-select: text;
+  cursor: pointer;
 }
 
 .sp-meta {

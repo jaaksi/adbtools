@@ -778,6 +778,199 @@ fn copy_local_file(src: &str, dest: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ---------- SQLite 直接查看（本地 rusqlite，避免依赖设备端 sqlite3） ----------
+
+#[derive(Debug, Serialize)]
+pub struct SqliteResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+}
+
+fn is_valid_ident(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+fn sqlite_temp_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("adbtools-sqlite")
+}
+
+// 使用 `adb exec-out` 取原始字节（不会被 pty 做 \n → \r\n 转换），写到本地
+// 用于 /data/data/<pkg>/ 下的文件（需要 run-as）
+fn exec_out_run_as_cat(
+    serial: &str,
+    package: &str,
+    rel: &str,
+    local: &std::path::Path,
+) -> Result<(), String> {
+    let output = Command::new("adb")
+        .args([
+            "-s", serial, "exec-out", "run-as", package, "cat", rel,
+        ])
+        .output()
+        .map_err(|e| format!("exec-out run-as cat 执行失败: {}", e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "exec-out run-as cat 失败: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    std::fs::write(local, &output.stdout).map_err(|e| format!("写入本地失败: {}", e))
+}
+
+// 把 `/data/data/<pkg>/<rel>` 及其可选的 -wal / -shm 文件拉到本地。
+// 返回本地主 db 文件路径
+fn pull_db_to_local(
+    serial: &str,
+    package: &str,
+    rel: &str,
+    key: &str,
+) -> Result<std::path::PathBuf, String> {
+    let dir = sqlite_temp_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败: {}", e))?;
+    // 每次都重新拉，保证拿到最新数据
+    let file_name = std::path::Path::new(rel)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("db");
+    let safe_key: String = key
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect();
+    let local_db = dir.join(format!("{}_{}", safe_key, file_name));
+
+    exec_out_run_as_cat(serial, package, rel, &local_db)?;
+
+    // -wal / -shm 尽力而为，不存在时静默忽略
+    for suffix in ["-wal", "-shm"] {
+        let remote = format!("{}{}", rel, suffix);
+        let local_extra = dir.join(format!("{}_{}{}", safe_key, file_name, suffix));
+        let _ = exec_out_run_as_cat(serial, package, &remote, &local_extra);
+    }
+
+    Ok(local_db)
+}
+
+fn row_cell_to_string(v: rusqlite::types::ValueRef<'_>) -> String {
+    use rusqlite::types::ValueRef;
+    match v {
+        ValueRef::Null => String::new(),
+        ValueRef::Integer(i) => i.to_string(),
+        ValueRef::Real(f) => f.to_string(),
+        ValueRef::Text(bytes) => String::from_utf8_lossy(bytes).to_string(),
+        ValueRef::Blob(bytes) => format!("<blob {} bytes>", bytes.len()),
+    }
+}
+
+#[tauri::command]
+fn sqlite_list_tables(
+    serial: &str,
+    package: &str,
+    db_path: &str,
+) -> Result<Vec<String>, String> {
+    let key = format!("list-{}-{}-{}", serial, package, db_path);
+    let local = pull_db_to_local(serial, package, db_path, &key)?;
+    let conn = rusqlite::Connection::open_with_flags(
+        &local,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|e| format!("打开数据库失败: {}", e))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )
+        .map_err(|e| format!("准备语句失败: {}", e))?;
+    let tables: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| format!("查询失败: {}", e))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(tables)
+}
+
+#[tauri::command]
+fn sqlite_query_table(
+    serial: &str,
+    package: &str,
+    db_path: &str,
+    table: &str,
+    limit: u32,
+    offset: u32,
+    search: Option<String>,
+) -> Result<SqliteResult, String> {
+    if !is_valid_ident(table) {
+        return Err(format!("非法表名: {}", table));
+    }
+    let limit = limit.clamp(1, 1000);
+    let key = format!("query-{}-{}-{}", serial, package, db_path);
+    let local = pull_db_to_local(serial, package, db_path, &key)?;
+    let conn = rusqlite::Connection::open_with_flags(
+        &local,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|e| format!("打开数据库失败: {}", e))?;
+
+    // 预取一下列名，顺便拿到首列（用作搜索目标列）
+    let first_col: Option<String> = {
+        let stmt = conn
+            .prepare(&format!("SELECT * FROM \"{}\" LIMIT 0", table))
+            .map_err(|e| format!("获取列名失败: {}", e))?;
+        stmt.column_names().first().map(|s| s.to_string())
+    };
+
+    let search_q = search.and_then(|s| {
+        let t = s.trim().to_string();
+        if t.is_empty() { None } else { Some(t) }
+    });
+
+    let (sql, pattern) = match (&search_q, &first_col) {
+        (Some(q), Some(col)) => (
+            format!(
+                "SELECT * FROM \"{}\" WHERE CAST(\"{}\" AS TEXT) LIKE ?1 LIMIT {} OFFSET {}",
+                table, col, limit, offset
+            ),
+            Some(format!("%{}%", q)),
+        ),
+        _ => (
+            format!(
+                "SELECT * FROM \"{}\" LIMIT {} OFFSET {}",
+                table, limit, offset
+            ),
+            None,
+        ),
+    };
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("准备查询失败: {}", e))?;
+    let columns: Vec<String> = stmt
+        .column_names()
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
+    let col_count = columns.len();
+    let mut rows_iter = match &pattern {
+        Some(p) => stmt
+            .query([p.as_str()])
+            .map_err(|e| format!("执行查询失败: {}", e))?,
+        None => stmt.query([]).map_err(|e| format!("执行查询失败: {}", e))?,
+    };
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    while let Some(row) = rows_iter
+        .next()
+        .map_err(|e| format!("读取行失败: {}", e))?
+    {
+        let mut out_row = Vec::with_capacity(col_count);
+        for i in 0..col_count {
+            let v = row
+                .get_ref(i)
+                .map_err(|e| format!("读取列失败: {}", e))?;
+            out_row.push(row_cell_to_string(v));
+        }
+        rows.push(out_row);
+    }
+    Ok(SqliteResult { columns, rows })
+}
+
 #[tauri::command]
 fn take_screenshot(serial: &str, save_path: &str) -> Result<String, String> {
     let temp_path = "/sdcard/screenshot.png";
@@ -1536,6 +1729,8 @@ pub fn run() {
             preview_remote_file,
             cleanup_preview_temp,
             copy_local_file,
+            sqlite_list_tables,
+            sqlite_query_table,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
