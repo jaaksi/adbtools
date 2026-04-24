@@ -1,5 +1,5 @@
 [package]
-name = "tools"
+name = "adbtools"
 version = "0.1.0"
 description = "A Tauri App"
 authors = ["you"]
@@ -11,8 +11,13 @@ edition = "2021"
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "tools_lib"
+name = "adbtools_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+# 显式设置 bin 名，让 dev 模式下 Dock tooltip 显示更友好
+[[bin]]
+name = "AdbTools"
+path = "src/main.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

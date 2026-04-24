@@ -21,7 +21,6 @@ const navModeLoading = ref(false);
 const navModeOptions = [
   { label: "手势导航", value: "gestural" },
   { label: "三按键", value: "threebutton" },
-  { label: "两按键", value: "twobutton" },
 ];
 
 // 切换过程中的 loading（避免快速连点）
@@ -137,6 +136,7 @@ async function onNavigationModeChange(v: string | number | boolean) {
     return;
   }
   const next = String(v);
+  if (next === navigationMode.value) return; // 点击当前已选项不做事
   const prev = navigationMode.value;
   navigationMode.value = next;
   navModeLoading.value = true;
@@ -342,19 +342,37 @@ watch(
 
         <el-col :span="24" style="margin-top: 20px">
           <el-card class="toggle-card">
-            <div class="toggle-row">
-              <div class="toggle-info">
-                <div class="toggle-title">导航模式</div>
-                <div class="toggle-desc">
-                  切换系统导航栏样式（cmd overlay enable-exclusive）
-                </div>
+            <div class="toggle-info" style="margin-bottom: 12px">
+              <div class="toggle-title">导航模式</div>
+              <div class="toggle-desc">
+                切换系统导航栏样式（cmd overlay enable-exclusive）
               </div>
-              <el-segmented
-                v-model="navigationMode"
-                :options="navModeOptions"
-                :disabled="navModeLoading"
-                @change="onNavigationModeChange"
-              />
+            </div>
+            <div class="nav-mode-tiles" :class="{ 'is-loading': navModeLoading }">
+              <div
+                v-for="opt in navModeOptions"
+                :key="opt.value"
+                class="nav-mode-tile"
+                :class="{ active: navigationMode === opt.value }"
+                @click="onNavigationModeChange(opt.value)"
+              >
+                <div class="nav-preview" :data-kind="opt.value">
+                  <!-- 手势：一条圆角指示条 -->
+                  <span v-if="opt.value === 'gestural'" class="nav-gesture-bar" />
+                  <!-- 三按键：◁ ○ ▢ -->
+                  <template v-else-if="opt.value === 'threebutton'">
+                    <span class="nav-btn-back" />
+                    <span class="nav-btn-home" />
+                    <span class="nav-btn-recents" />
+                  </template>
+                  <!-- 两按键：一颗胶囊 + 返回箭头 -->
+                  <template v-else>
+                    <span class="nav-btn-back" />
+                    <span class="nav-two-pill" />
+                  </template>
+                </div>
+                <div class="nav-mode-label">{{ opt.label }}</div>
+              </div>
             </div>
           </el-card>
         </el-col>
@@ -435,5 +453,104 @@ watch(
   font-weight: bold;
   font-size: 14px;
   margin-bottom: 4px;
+}
+
+/* ---- 导航模式选择卡 ---- */
+.nav-mode-tiles {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+}
+
+.nav-mode-tiles.is-loading {
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+.nav-mode-tile {
+  border: 1.5px solid var(--el-border-color);
+  border-radius: 10px;
+  padding: 14px 10px 10px;
+  text-align: center;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  background: var(--el-fill-color-lighter);
+}
+
+.nav-mode-tile:hover {
+  border-color: var(--el-color-primary-light-5);
+  background: var(--el-color-primary-light-9);
+}
+
+.nav-mode-tile.active {
+  border-color: var(--el-color-primary);
+  background: var(--el-color-primary-light-9);
+  box-shadow: 0 0 0 1px var(--el-color-primary);
+}
+
+/* 迷你导航栏容器：模拟一段导航栏区域 */
+.nav-preview {
+  height: 40px;
+  border-radius: 8px;
+  background: #2c2c2e;
+  display: flex;
+  align-items: center;
+  justify-content: space-around;
+  padding: 0 24px;
+  margin-bottom: 10px;
+}
+
+/* 手势：一条圆角胶囊 */
+.nav-gesture-bar {
+  width: 60%;
+  height: 4px;
+  border-radius: 2px;
+  background: #ffffff;
+  opacity: 0.9;
+}
+
+/* 三按键：返回▷、圆、方 */
+.nav-btn-back {
+  width: 0;
+  height: 0;
+  border-top: 6px solid transparent;
+  border-bottom: 6px solid transparent;
+  border-right: 9px solid #ffffff;
+  opacity: 0.9;
+}
+
+.nav-btn-home {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 1.5px solid #ffffff;
+  opacity: 0.9;
+}
+
+.nav-btn-recents {
+  width: 11px;
+  height: 11px;
+  border: 1.5px solid #ffffff;
+  border-radius: 2px;
+  opacity: 0.9;
+}
+
+/* 两按键：胶囊状 home */
+.nav-two-pill {
+  width: 40%;
+  height: 8px;
+  border-radius: 4px;
+  background: #ffffff;
+  opacity: 0.9;
+}
+
+.nav-mode-label {
+  font-size: 13px;
+  color: var(--el-text-color-regular);
+}
+
+.nav-mode-tile.active .nav-mode-label {
+  color: var(--el-color-primary);
+  font-weight: 500;
 }
 </style>

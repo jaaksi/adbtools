@@ -499,12 +499,34 @@ fn parse_file_list(output: &str, base_path: &str) -> Result<Vec<FileInfo>, Strin
         }
 
         let parts: Vec<&str> = trimmed.split_whitespace().collect();
-        if parts.len() < 6 {
+        // 标准 `ls -la` 输出 8 列：perm links owner group size date time name[...]
+        // 符号链接会多出 "-> target" 两段
+        if parts.len() < 8 {
             continue;
         }
 
+        let permissions = parts[0].to_string();
+        let is_symlink = permissions.starts_with('l');
+        let is_dir = permissions.starts_with('d') || is_symlink;
+
+        // 提取文件名：从第 8 个字段（index 7）起到末尾 join 成一整个 name
+        // 符号链接遇到 "->" 则截断，取 " -> " 前面的部分作为链接名
+        let name_start = 7;
+        let name_end = if is_symlink {
+            parts[name_start..]
+                .iter()
+                .position(|&p| p == "->")
+                .map(|i| name_start + i)
+                .unwrap_or(parts.len())
+        } else {
+            parts.len()
+        };
+        if name_start >= name_end {
+            continue;
+        }
+        let name = parts[name_start..name_end].join(" ");
+
         // 跳过隐藏文件/目录（以 . 开头）
-        let name = parts.last().unwrap_or(&"");
         if name.starts_with('.') {
             continue;
         }
@@ -514,24 +536,14 @@ fn parse_file_list(output: &str, base_path: &str) -> Result<Vec<FileInfo>, Strin
             continue;
         }
 
-        let permissions = parts[0].to_string();
-        let is_dir = permissions.starts_with('d') || permissions.starts_with('l');
-        
-        let size: Option<String> = if !is_dir && parts.len() >= 5 {
+        let size: Option<String> = if !is_dir {
             parts[4].parse::<u64>().ok().map(|s| format!("{} B", s))
         } else {
             None
         };
-        
-        let modified_time: Option<String> = if parts.len() >= 8 {
-            Some(format!("{} {} {}", parts[5], parts[6], parts[7]))
-        } else if parts.len() >= 7 {
-            Some(format!("{} {}", parts[5], parts[6]))
-        } else {
-            None
-        };
-        
-        let name = parts.last().unwrap_or(&"").to_string();
+
+        let modified_time: Option<String> = Some(format!("{} {}", parts[5], parts[6]));
+
         let clean_base = base_path.trim_end_matches('/');
         let full_path = if clean_base == "" {
             format!("/{}", name)
@@ -1410,22 +1422,52 @@ pub fn run() {
         .manage(OAuthState(Mutex::new(None)))
         .manage(RecordingState(Mutex::new(None)))
         .menu(|handle| {
-            // 在系统默认菜单的 Help 子菜单里追加"下载 ADB"
+            // 在系统默认菜单的 Help 子菜单里追加"下载 ADB"；
+            // 同时把 dev 模式下 macOS App 菜单里继承自 bin 名的 "AdbTools" 强制改成 "ADB Tools"
             let menu = Menu::default(handle)?;
             let download_item = MenuItem::with_id(
                 handle,
                 "download_adb",
-                "下载 ADB",
+                "未安装 ADB?",
                 true,
                 None::<&str>,
             )?;
 
+            const APP_NAME: &str = "ADB Tools";
+
+            let mut is_first_submenu = true;
             for item in menu.items()? {
                 if let MenuItemKind::Submenu(sm) = item {
+                    // 第一个 submenu 就是 macOS 的 App 菜单
+                    if is_first_submenu {
+                        is_first_submenu = false;
+                        let _ = sm.set_text(APP_NAME);
+                        // 把里面形如 "About X / Hide X / Quit X" 的项显式改名
+                        if let Ok(children) = sm.items() {
+                            for child in children {
+                                if let MenuItemKind::Predefined(p) = child {
+                                    if let Ok(t) = p.text() {
+                                        let new_text = if t.starts_with("About ") {
+                                            Some(format!("About {}", APP_NAME))
+                                        } else if t.starts_with("Hide ") && !t.starts_with("Hide Others") {
+                                            Some(format!("Hide {}", APP_NAME))
+                                        } else if t.starts_with("Quit ") {
+                                            Some(format!("Quit {}", APP_NAME))
+                                        } else {
+                                            None
+                                        };
+                                        if let Some(nt) = new_text {
+                                            let _ = p.set_text(&nt);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     if let Ok(text) = sm.text() {
                         if text == "Help" || text == "帮助" {
                             sm.append(&download_item)?;
-                            break;
                         }
                     }
                 }

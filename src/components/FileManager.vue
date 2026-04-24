@@ -12,7 +12,6 @@ import {
   Delete,
   Search,
   Box,
-  View,
   CopyDocument,
   FolderOpened,
   Close,
@@ -47,6 +46,14 @@ const currentPath = ref("/data/data");
 const pathHistory = ref<string[]>([]);
 const isDataDataView = ref(false);
 const searchQuery = ref("");
+const fileSearchQuery = ref("");
+
+// 普通目录下的文件按名称过滤
+const filteredFiles = computed(() => {
+  const q = fileSearchQuery.value.trim().toLowerCase();
+  if (!q) return files.value;
+  return files.value.filter((f) => f.name.toLowerCase().includes(q));
+});
 
 // ---- 文件预览浮层 ----
 interface FilePreview {
@@ -76,12 +83,13 @@ async function openPreview(row: FileInfo) {
   previewTarget.value = row;
   preview.value = null;
   previewError.value = "";
+  spSearch.value = "";
   previewVisible.value = true;
   previewLoading.value = true;
   try {
     preview.value = await invoke<FilePreview>("preview_remote_file", {
       serial: props.selectedDevice,
-      remotePath: row.path,
+      remotePath: resolveRemotePath(row.path),
     });
   } catch (e) {
     previewError.value = String(e);
@@ -150,6 +158,86 @@ function formatPreviewSize(n: number): string {
   return `${(n / 1024 / 1024).toFixed(2)} MB`;
 }
 
+// ---- SharedPreferences XML 解析（<map>...</map>） ----
+interface SpEntry {
+  key: string;
+  value: string;
+  type: string;
+}
+
+const spSearch = ref("");
+
+const spEntries = computed<SpEntry[] | null>(() => {
+  if (!preview.value || preview.value.kind !== "text" || !preview.value.text) {
+    return null;
+  }
+  const text = preview.value.text.trim();
+  // 简单识别：内容是 Android SP 的 <map> 文档（可能带 XML 声明）
+  if (!/^<\?xml[^>]*\?>/.test(text) && !text.startsWith("<map")) {
+    return null;
+  }
+  if (!/<map[\s>]/i.test(text)) return null;
+
+  try {
+    const doc = new DOMParser().parseFromString(text, "text/xml");
+    const parserError = doc.querySelector("parsererror");
+    if (parserError) return null;
+    const map = doc.querySelector("map");
+    if (!map) return null;
+
+    const entries: SpEntry[] = [];
+    for (const el of Array.from(map.children)) {
+      const tag = el.tagName.toLowerCase();
+      const key = el.getAttribute("name") ?? "";
+      let value = "";
+      let type = tag;
+      switch (tag) {
+        case "string":
+          value = el.textContent ?? "";
+          break;
+        case "boolean":
+        case "int":
+        case "long":
+        case "float":
+          value = el.getAttribute("value") ?? "";
+          break;
+        case "set":
+          value = Array.from(el.children)
+            .map((c) => c.textContent ?? "")
+            .join(", ");
+          type = "set<string>";
+          break;
+        default:
+          value = el.outerHTML;
+      }
+      entries.push({ key, value, type });
+    }
+    return entries;
+  } catch {
+    return null;
+  }
+});
+
+const filteredSpEntries = computed(() => {
+  if (!spEntries.value) return [];
+  const q = spSearch.value.trim().toLowerCase();
+  if (!q) return spEntries.value;
+  return spEntries.value.filter(
+    (e) =>
+      e.key.toLowerCase().includes(q) ||
+      e.value.toLowerCase().includes(q)
+  );
+});
+
+async function copySpValue(row: SpEntry) {
+  try {
+    await navigator.clipboard.writeText(row.value);
+    ElMessage.success(`已复制 ${row.key}`);
+  } catch (e) {
+    ElMessage.error(`复制失败: ${e}`);
+  }
+}
+
 // 从 localStorage 加载搜索记录
 onMounted(() => {
   const savedSearch = localStorage.getItem("adb_tool_app_search");
@@ -211,6 +299,8 @@ async function loadFiles() {
     allApps.value = [];
     return;
   }
+  // 切换目录时清空文件名搜索，避免上一级的查询影响当前目录
+  fileSearchQuery.value = "";
   loading.value = true;
   
   if (currentPath.value === "/data/data") {
@@ -266,25 +356,33 @@ async function loadFiles() {
   }
 }
 
+// /data/data/<pkg>/ 下 run_as_list_files 返回的是相对路径（相对 app data 目录），
+// adb pull / delete / preview 需要绝对路径，这里根据 currentPath 补齐前缀
+function resolveRemotePath(path: string): string {
+  if (path.startsWith("/")) return path;
+  if (!currentPath.value.startsWith("/data/data/")) return path;
+  const afterData = currentPath.value.substring(11); // "<pkg>" 或 "<pkg>/<sub>"
+  const slashIdx = afterData.indexOf("/");
+  const pkg = slashIdx === -1 ? afterData : afterData.substring(0, slashIdx);
+  return `/data/data/${pkg}/${path}`;
+}
+
 async function navigateTo(path: string) {
   pathHistory.value.push(currentPath.value);
-  
-  // 如果是 run-as 路径，需要构建正确的相对路径
+
   if (currentPath.value.startsWith("/data/data/")) {
+    // run-as 视图下：path 已经是相对 app data 根目录的完整相对路径
+    // （parse_file_list 会把 base_path 拼进去，例如当前在 "files"，子项 "actions" → "files/actions"）
+    // 所以这里直接用 path 覆盖子路径，不再与 currentSubPath 拼接，避免路径重复
     const afterData = currentPath.value.substring(11);
-    const slashIdx = afterData.indexOf('/');
+    const slashIdx = afterData.indexOf("/");
     const packageName = slashIdx === -1 ? afterData : afterData.substring(0, slashIdx);
-    const currentSubPath = slashIdx === -1 ? "" : afterData.substring(slashIdx + 1);
-    
-    // 如果 path 是绝对路径（以 / 开头），需要去掉开头的 /
-    const cleanPath = path.startsWith('/') ? path.substring(1) : path;
-    const newSubPath = currentSubPath ? `${currentSubPath}/${cleanPath}` : cleanPath;
-    
-    currentPath.value = `/data/data/${packageName}/${newSubPath}`;
+    const cleanPath = path.startsWith("/") ? path.substring(1) : path;
+    currentPath.value = `/data/data/${packageName}/${cleanPath}`;
   } else {
     currentPath.value = path;
   }
-  
+
   loadFiles();
 }
 
@@ -365,8 +463,9 @@ async function pushFile() {
 async function pullFile(remotePath: string) {
   if (!props.selectedDevice) return;
 
+  const absolutePath = resolveRemotePath(remotePath);
   const savePath = await save({
-    defaultPath: remotePath.split("/").pop(),
+    defaultPath: absolutePath.split("/").pop(),
   });
 
   if (savePath) {
@@ -374,7 +473,7 @@ async function pullFile(remotePath: string) {
       loading.value = true;
       const result = await invoke("pull_file", {
         serial: props.selectedDevice,
-        remotePath,
+        remotePath: absolutePath,
         localPath: savePath,
       });
       ElMessage.success(result as string);
@@ -392,7 +491,7 @@ async function deleteFile(path: string) {
   try {
     await invoke("delete_file", {
       serial: props.selectedDevice,
-      remotePath: path,
+      remotePath: resolveRemotePath(path),
     });
     ElMessage.success("删除成功");
     loadFiles();
@@ -425,8 +524,8 @@ watch(() => props.selectedDevice, loadFiles, { immediate: true });
     <div class="breadcrumb">
       <span class="breadcrumb-label">当前路径：</span>
       <el-breadcrumb separator="/">
-        <el-breadcrumb-item 
-          v-for="(segment, index) in pathSegments" 
+        <el-breadcrumb-item
+          v-for="(segment, index) in pathSegments"
           :key="index"
           @click="navigateToSegment(index)"
           :class="{ 'clickable': true }"
@@ -434,6 +533,19 @@ watch(() => props.selectedDevice, loadFiles, { immediate: true });
           {{ segment.name || '根目录' }}
         </el-breadcrumb-item>
       </el-breadcrumb>
+    </div>
+
+    <div v-if="!isDataDataView" class="file-search-row">
+      <el-input
+        v-model="fileSearchQuery"
+        placeholder="搜索当前目录下的文件名"
+        :prefix-icon="Search"
+        clearable
+        style="max-width: 320px"
+      />
+      <span v-if="fileSearchQuery" class="file-search-meta">
+        匹配 {{ filteredFiles.length }} / {{ files.length }} 项
+      </span>
     </div>
 
     <div v-if="!selectedDevice" class="empty-state">
@@ -480,11 +592,12 @@ watch(() => props.selectedDevice, loadFiles, { immediate: true });
     <el-table
       v-else
       v-loading="loading"
-      :data="files"
+      :data="filteredFiles"
       class="fill-table"
       style="width: 100%"
       height="100%"
-      @row-click="(row: FileInfo) => row.is_dir && navigateTo(row.path)"
+      row-class-name="file-row-clickable"
+      @row-click="(row: FileInfo) => row.is_dir ? navigateTo(row.path) : openPreview(row)"
     >
       <el-table-column width="50">
         <template #default="{ row }">
@@ -507,14 +620,6 @@ watch(() => props.selectedDevice, loadFiles, { immediate: true });
       <el-table-column label="操作" width="200" fixed="right">
         <template #default="{ row }">
           <el-button-group>
-            <el-button
-              v-if="!row.is_dir"
-              size="small"
-              :icon="View"
-              @click.stop="openPreview(row)"
-            >
-              查看
-            </el-button>
             <el-button
               v-if="!row.is_dir"
               size="small"
@@ -541,6 +646,8 @@ watch(() => props.selectedDevice, loadFiles, { immediate: true });
       v-model="previewVisible"
       :title="previewTarget ? `查看 · ${previewTarget.name}` : '查看'"
       width="760px"
+      top="6vh"
+      class="preview-dialog"
       append-to-body
       destroy-on-close
       @closed="onPreviewClosed"
@@ -559,7 +666,38 @@ watch(() => props.selectedDevice, loadFiles, { immediate: true });
           <div class="preview-meta">
             {{ preview.mime }} · {{ formatPreviewSize(preview.size) }}
           </div>
-          <pre v-if="preview.kind === 'text'" class="preview-text">{{ preview.text }}</pre>
+          <div v-if="preview.kind === 'text' && spEntries" class="preview-sp">
+            <el-input
+              v-model="spSearch"
+              placeholder="搜索 key 或 value"
+              clearable
+              class="sp-search"
+              :prefix-icon="Search"
+            />
+            <div class="sp-meta">
+              共 {{ spEntries.length }} 项
+              <template v-if="spSearch">
+                · 匹配 {{ filteredSpEntries.length }} 项
+              </template>
+            </div>
+            <el-table
+              :data="filteredSpEntries"
+              size="small"
+              stripe
+              class="preview-sp-table"
+              max-height="calc(88vh - 260px)"
+              empty-text="没有匹配的条目"
+              @row-click="copySpValue"
+            >
+              <el-table-column prop="key" label="Key" min-width="160" show-overflow-tooltip />
+              <el-table-column prop="value" label="Value" min-width="220" show-overflow-tooltip />
+              <el-table-column prop="type" label="Type" width="110" />
+            </el-table>
+          </div>
+          <pre
+            v-else-if="preview.kind === 'text'"
+            class="preview-text"
+          >{{ preview.text }}</pre>
           <div v-else-if="preview.kind === 'image'" class="preview-image-wrap">
             <img :src="preview.data_url || ''" class="preview-image" />
           </div>
@@ -610,6 +748,10 @@ watch(() => props.selectedDevice, loadFiles, { immediate: true });
   min-height: 0;
 }
 
+:deep(.file-row-clickable) {
+  cursor: pointer;
+}
+
 .preview-path {
   font-family: "Courier New", monospace;
   font-size: 12px;
@@ -626,6 +768,16 @@ watch(() => props.selectedDevice, loadFiles, { immediate: true });
 
 .preview-body {
   min-height: 120px;
+}
+
+.sp-search {
+  margin-bottom: 8px;
+}
+
+.sp-meta {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  margin-bottom: 8px;
 }
 
 .preview-text {
@@ -680,6 +832,19 @@ watch(() => props.selectedDevice, loadFiles, { immediate: true });
 .header-actions {
   display: flex;
   gap: 10px;
+}
+
+.file-search-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+  flex-shrink: 0;
+}
+
+.file-search-meta {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
 }
 
 .breadcrumb {
@@ -741,4 +906,31 @@ watch(() => props.selectedDevice, loadFiles, { immediate: true });
 .app-item:hover {
   color: #409EFF;
 }
+</style>
+
+<style>
+/* 预览浮层（append-to-body 会把 dialog 挪出组件，scoped 样式够不到，这里用全局样式） */
+.preview-dialog.el-dialog {
+  display: flex;
+  flex-direction: column;
+  max-height: 88vh;
+  overflow: hidden;
+}
+
+.preview-dialog .el-dialog__header {
+  flex-shrink: 0;
+}
+
+/* body 自身不滚；内部由 el-table 或 <pre> 自己处理滚动 */
+.preview-dialog .el-dialog__body {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.preview-dialog .el-dialog__footer {
+  flex-shrink: 0;
+  border-top: 1px solid var(--el-border-color-lighter);
+}
+
 </style>
