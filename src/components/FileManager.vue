@@ -379,6 +379,9 @@ async function navigateTo(path: string) {
     const packageName = slashIdx === -1 ? afterData : afterData.substring(0, slashIdx);
     const cleanPath = path.startsWith("/") ? path.substring(1) : path;
     currentPath.value = `/data/data/${packageName}/${cleanPath}`;
+  } else if (path === "/data") {
+    // /data 在非 root 设备无法直接 ls，统一跳到应用列表（/data/data）
+    currentPath.value = "/data/data";
   } else {
     currentPath.value = path;
   }
@@ -523,16 +526,18 @@ watch(() => props.selectedDevice, loadFiles, { immediate: true });
 
     <div class="breadcrumb">
       <span class="breadcrumb-label">当前路径：</span>
-      <el-breadcrumb separator="/">
-        <el-breadcrumb-item
-          v-for="(segment, index) in pathSegments"
-          :key="index"
-          @click="navigateToSegment(index)"
-          :class="{ 'clickable': true }"
-        >
-          {{ segment.name || '根目录' }}
-        </el-breadcrumb-item>
-      </el-breadcrumb>
+      <div class="breadcrumb-segments">
+        <template v-for="(segment, index) in pathSegments" :key="index">
+          <span v-if="index > 0" class="breadcrumb-sep">/</span>
+          <span
+            class="breadcrumb-seg"
+            :class="{ 'is-current': index === pathSegments.length - 1 }"
+            @click="navigateToSegment(index)"
+          >
+            {{ segment.name || '根目录' }}
+          </span>
+        </template>
+      </div>
     </div>
 
     <div v-if="!isDataDataView" class="file-search-row">
@@ -868,6 +873,38 @@ watch(() => props.selectedDevice, loadFiles, { immediate: true });
 
 .clickable:hover {
   color: #66b1ff;
+}
+
+.breadcrumb-segments {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  font-size: 14px;
+}
+
+.breadcrumb-seg {
+  cursor: pointer;
+  color: #303133;
+  white-space: nowrap;
+}
+
+.breadcrumb-seg:hover {
+  color: #409EFF;
+}
+
+.breadcrumb-seg.is-current {
+  color: #909399;
+  cursor: default;
+}
+
+.breadcrumb-seg.is-current:hover {
+  color: #909399;
+}
+
+.breadcrumb-sep {
+  color: #c0c4cc;
+  user-select: none;
 }
 
 .empty-state {
