@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+use std::path::PathBuf;
 use std::process::{Child, Command};
+use std::sync::OnceLock;
 use std::sync::mpsc::{channel, Sender, TryRecvError};
 use std::sync::Mutex;
 use std::thread;
@@ -59,9 +61,57 @@ pub struct FileInfo {
     pub modified_time: Option<String>,
 }
 
+// 双击 .app 启动时进程的 PATH 不包含用户 shell 路径，找不到 adb。
+// 这里在常见位置依次找 adb，并缓存绝对路径，所有 adb 调用都走这个。
+static ADB_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+fn locate_adb() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    // 1) PATH 里直接能找到（dev / 终端启动场景）
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            candidates.push(dir.join(if cfg!(windows) { "adb.exe" } else { "adb" }));
+        }
+    }
+
+    // 2) macOS / Linux 常见位置
+    if let Ok(home) = std::env::var("HOME") {
+        let home = std::path::Path::new(&home);
+        candidates.push(home.join("Library/Android/sdk/platform-tools/adb"));
+        candidates.push(home.join("Android/Sdk/platform-tools/adb"));
+        candidates.push(home.join(".android/sdk/platform-tools/adb"));
+    }
+    candidates.push(PathBuf::from("/opt/homebrew/bin/adb")); // Apple Silicon brew
+    candidates.push(PathBuf::from("/usr/local/bin/adb")); // Intel brew
+    candidates.push(PathBuf::from("/usr/bin/adb"));
+
+    // 3) ANDROID_HOME / ANDROID_SDK_ROOT
+    for env_key in ["ANDROID_HOME", "ANDROID_SDK_ROOT"] {
+        if let Ok(root) = std::env::var(env_key) {
+            candidates.push(std::path::Path::new(&root).join("platform-tools/adb"));
+        }
+    }
+
+    // 4) Windows
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        candidates.push(std::path::Path::new(&local).join("Android/Sdk/platform-tools/adb.exe"));
+    }
+
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+fn adb_path() -> Result<&'static PathBuf, String> {
+    let resolved = ADB_PATH.get_or_init(locate_adb);
+    resolved
+        .as_ref()
+        .ok_or_else(|| "未找到 adb 可执行文件。请安装 Android Platform Tools，或确认其在 PATH 中。".to_string())
+}
+
 fn run_adb_command(args: &[&str]) -> Result<String, String> {
-    eprintln!("ADB command: adb {}", args.join(" "));
-    let output = Command::new("adb")
+    let adb = adb_path()?;
+    eprintln!("ADB command: {} {}", adb.display(), args.join(" "));
+    let output = Command::new(adb)
         .args(args)
         .output()
         .map_err(|e| format!("Failed to execute adb: {}", e))?;
@@ -676,7 +726,7 @@ fn preview_remote_file(serial: &str, remote_path: &str) -> Result<FilePreview, S
                 None => return Err(format!("adb pull 失败: {}", err)),
             };
             // 把 run-as cat 的原始字节写入本地临时文件
-            let output = Command::new("adb")
+            let output = Command::new(adb_path()?)
                 .args(["-s", serial, "shell", "run-as", pkg, "cat", rel])
                 .output()
                 .map_err(|e| format!("run-as cat 执行失败: {}", e))?;
@@ -778,6 +828,86 @@ fn copy_local_file(src: &str, dest: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ---------- 应用权限：批量查看/切换 ----------
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PermissionInfo {
+    pub name: String,
+    pub granted: bool,
+    pub flags: String,
+}
+
+#[tauri::command]
+fn list_runtime_permissions(
+    serial: &str,
+    package: &str,
+) -> Result<Vec<PermissionInfo>, String> {
+    let out = run_adb_command(&["-s", serial, "shell", "dumpsys", "package", package])?;
+
+    // dumpsys package 输出里会有多个 "User 0: ... runtime permissions:" 段，格式：
+    //   runtime permissions:
+    //     android.permission.CAMERA: granted=true, flags=[ USER_SET ]
+    //     com.foo.permission.X: granted=false, flags=[ ... ]
+    // 另外 "install permissions:" 段里的普通权限不参与 runtime 授予，跳过。
+    use std::collections::HashMap;
+    let mut latest: HashMap<String, PermissionInfo> = HashMap::new();
+    let mut in_runtime = false;
+    for line in out.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("runtime permissions:") {
+            in_runtime = true;
+            continue;
+        }
+        if trimmed.ends_with("permissions:") || trimmed.starts_with("User ") {
+            in_runtime = trimmed.starts_with("runtime permissions:")
+                || (in_runtime && trimmed.starts_with("User "));
+            if !trimmed.starts_with("runtime permissions:") {
+                in_runtime = false;
+            }
+            continue;
+        }
+        if !in_runtime {
+            continue;
+        }
+        if !trimmed.contains(".permission.") || !trimmed.contains("granted=") {
+            continue;
+        }
+        let Some((name_part, rest)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let name = name_part.trim().to_string();
+        let granted = rest.contains("granted=true");
+        let flags = rest
+            .split("flags=")
+            .nth(1)
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        latest.insert(
+            name.clone(),
+            PermissionInfo {
+                name,
+                granted,
+                flags,
+            },
+        );
+    }
+
+    let mut list: Vec<PermissionInfo> = latest.into_values().collect();
+    list.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(list)
+}
+
+#[tauri::command]
+fn set_permission(
+    serial: &str,
+    package: &str,
+    permission: &str,
+    granted: bool,
+) -> Result<String, String> {
+    let action = if granted { "grant" } else { "revoke" };
+    run_adb_command(&["-s", serial, "shell", "pm", action, package, permission])
+}
+
 // ---------- SQLite 直接查看（本地 rusqlite，避免依赖设备端 sqlite3） ----------
 
 #[derive(Debug, Serialize)]
@@ -802,7 +932,7 @@ fn exec_out_run_as_cat(
     rel: &str,
     local: &std::path::Path,
 ) -> Result<(), String> {
-    let output = Command::new("adb")
+    let output = Command::new(adb_path()?)
         .args([
             "-s", serial, "exec-out", "run-as", package, "cat", rel,
         ])
@@ -1015,7 +1145,7 @@ fn start_screen_record(serial: String, state: State<'_, RecordingState>) -> Resu
     );
 
     // 以子进程方式启动 screenrecord（该命令会阻塞直到录制结束或收到信号）
-    let child = Command::new("adb")
+    let child = Command::new(adb_path()?)
         .args(&["-s", &serial, "shell", "screenrecord", &remote_path])
         .spawn()
         .map_err(|e| format!("启动录屏失败: {}", e))?;
@@ -1140,7 +1270,7 @@ fn export_logcat(
         "ADB command: adb -s {} logcat -d -b {} -v threadtime (filter pkg={:?}, pids={:?})",
         serial, buffer_arg, filter_pkg, pids
     );
-    let output = Command::new("adb")
+    let output = Command::new(adb_path()?)
         .args(["-s", serial, "logcat", "-d", "-b", buffer_arg, "-v", "threadtime"])
         .output()
         .map_err(|e| format!("执行 adb logcat 失败: {}", e))?;
@@ -1731,6 +1861,8 @@ pub fn run() {
             copy_local_file,
             sqlite_list_tables,
             sqlite_query_table,
+            list_runtime_permissions,
+            set_permission,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

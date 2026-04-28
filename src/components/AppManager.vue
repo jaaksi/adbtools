@@ -11,6 +11,7 @@ import {
   VideoPause,
   Delete,
   Close,
+  Key,
 } from "@element-plus/icons-vue";
 
 interface AppInfo {
@@ -19,6 +20,12 @@ interface AppInfo {
   version_name?: string;
   version_code?: string;
   is_system_app: boolean;
+}
+
+interface PermissionInfo {
+  name: string;
+  granted: boolean;
+  flags: string;
 }
 
 const props = defineProps<{
@@ -161,6 +168,92 @@ const filteredApps = computed(() => {
   );
 });
 
+// 权限弹窗
+const permDialogVisible = ref(false);
+const permTargetPackage = ref("");
+const permissions = ref<PermissionInfo[]>([]);
+const permLoading = ref(false);
+const permSearch = ref("");
+
+const filteredPermissions = computed(() => {
+  const q = permSearch.value.trim().toLowerCase();
+  if (!q) return permissions.value;
+  return permissions.value.filter((p) => p.name.toLowerCase().includes(q));
+});
+
+async function openPermissions(pkg: string) {
+  permTargetPackage.value = pkg;
+  permDialogVisible.value = true;
+  permSearch.value = "";
+  await loadPermissions();
+}
+
+async function loadPermissions() {
+  if (!props.selectedDevice || !permTargetPackage.value) return;
+  permLoading.value = true;
+  try {
+    permissions.value = await invoke<PermissionInfo[]>(
+      "list_runtime_permissions",
+      { serial: props.selectedDevice, package: permTargetPackage.value }
+    );
+  } catch (e) {
+    ElMessage.error(`获取权限失败: ${e}`);
+    permissions.value = [];
+  } finally {
+    permLoading.value = false;
+  }
+}
+
+async function togglePermission(perm: PermissionInfo, granted: boolean) {
+  const prev = perm.granted;
+  perm.granted = granted;
+  try {
+    await invoke("set_permission", {
+      serial: props.selectedDevice,
+      package: permTargetPackage.value,
+      permission: perm.name,
+      granted,
+    });
+    ElMessage.success(`${perm.name.split(".").pop()} ${granted ? "已授予" : "已撤销"}`);
+  } catch (e) {
+    ElMessage.error(`${granted ? "授予" : "撤销"}失败: ${e}`);
+    perm.granted = prev;
+  }
+}
+
+async function bulkSetPermissions(granted: boolean) {
+  if (!permTargetPackage.value) return;
+  const targets = filteredPermissions.value.filter((p) => p.granted !== granted);
+  if (targets.length === 0) {
+    ElMessage.info(granted ? "已全部处于授予状态" : "已全部处于撤销状态");
+    return;
+  }
+  permLoading.value = true;
+  let ok = 0,
+    fail = 0;
+  for (const p of targets) {
+    try {
+      await invoke("set_permission", {
+        serial: props.selectedDevice,
+        package: permTargetPackage.value,
+        permission: p.name,
+        granted,
+      });
+      p.granted = granted;
+      ok++;
+    } catch (e) {
+      console.error(e);
+      fail++;
+    }
+  }
+  permLoading.value = false;
+  if (fail === 0) {
+    ElMessage.success(`已${granted ? "授予" : "撤销"} ${ok} 项权限`);
+  } else {
+    ElMessage.warning(`${granted ? "授予" : "撤销"} ${ok} 项成功, ${fail} 项失败`);
+  }
+}
+
 watch(() => props.selectedDevice, loadApps, { immediate: true });
 watch(filter, loadApps);
 </script>
@@ -209,7 +302,7 @@ watch(filter, loadApps);
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="280" fixed="right">
+      <el-table-column label="操作" width="360" fixed="right">
         <template #default="{ row }">
           <el-button-group>
             <el-button size="small" :icon="VideoPlay" @click="startApp(row.package_name)">
@@ -217,6 +310,9 @@ watch(filter, loadApps);
             </el-button>
             <el-button size="small" :icon="VideoPause" @click="stopApp(row.package_name)">
               停止
+            </el-button>
+            <el-button size="small" :icon="Key" @click="openPermissions(row.package_name)">
+              权限
             </el-button>
             <el-button size="small" :icon="Delete" @click="clearAppData(row.package_name)">
               清除
@@ -233,6 +329,62 @@ watch(filter, loadApps);
         </template>
       </el-table-column>
     </el-table>
+
+    <!-- 权限管理弹窗 -->
+    <el-dialog
+      v-model="permDialogVisible"
+      :title="`权限 · ${permTargetPackage}`"
+      width="720px"
+      append-to-body
+    >
+      <div class="perm-toolbar">
+        <el-input
+          v-model="permSearch"
+          placeholder="搜索权限名"
+          :prefix-icon="Search"
+          clearable
+          style="width: 260px"
+        />
+        <span class="perm-meta">
+          共 {{ permissions.length }} 项
+          <template v-if="permSearch">· 匹配 {{ filteredPermissions.length }} 项</template>
+        </span>
+        <el-button size="small" @click="loadPermissions" :loading="permLoading">
+          刷新
+        </el-button>
+        <el-button size="small" type="success" @click="bulkSetPermissions(true)">
+          全部授予
+        </el-button>
+        <el-button size="small" type="danger" @click="bulkSetPermissions(false)">
+          全部撤销
+        </el-button>
+      </div>
+      <el-table
+        v-loading="permLoading"
+        :data="filteredPermissions"
+        size="small"
+        stripe
+        max-height="60vh"
+        empty-text="未检测到 runtime 权限（或应用不存在）"
+      >
+        <el-table-column prop="name" label="权限" min-width="320" show-overflow-tooltip />
+        <el-table-column label="状态" width="140">
+          <template #default="{ row }">
+            <el-switch
+              :model-value="row.granted"
+              active-text="已授予"
+              inactive-text="已撤销"
+              inline-prompt
+              @change="(v: boolean) => togglePermission(row, v)"
+            />
+          </template>
+        </el-table-column>
+        <el-table-column prop="flags" label="Flags" show-overflow-tooltip />
+      </el-table>
+      <template #footer>
+        <el-button @click="permDialogVisible = false">关闭</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -241,6 +393,19 @@ watch(filter, loadApps);
   height: 100%;
   display: flex;
   flex-direction: column;
+}
+
+.perm-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.perm-meta {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
 }
 
 .fill-table {
