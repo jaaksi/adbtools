@@ -16,6 +16,9 @@ import {
   CopyDocument,
   Aim,
 } from "@element-plus/icons-vue";
+import { useFavoritesStore } from "../stores/favorites";
+
+const favStore = useFavoritesStore();
 
 interface AppInfo {
   package_name: string;
@@ -97,7 +100,11 @@ watch(
 );
 
 // 日志导出 - 包名过滤
-const selectedLogPackage = ref("");
+// - localStorage 有非空值 → 用上次的选择
+// - 否则（null 或 ""）→ 回退到全局"最近一次关注"的包名
+const LOG_FILTER_PKG_KEY = "adbtools:logFilterPkg";
+const _storedLogPkg = localStorage.getItem(LOG_FILTER_PKG_KEY);
+const selectedLogPackage = ref(_storedLogPkg || favStore.lastFavorited);
 const appPickerVisible = ref(false);
 const appPickerLoading = ref(false);
 const appList = ref<AppInfo[]>([]);
@@ -251,11 +258,14 @@ async function loadApps() {
 
 function selectAppForLog(app: AppInfo) {
   selectedLogPackage.value = app.package_name;
+  localStorage.setItem(LOG_FILTER_PKG_KEY, app.package_name);
   appPickerVisible.value = false;
 }
 
 function clearSelectedLogPackage() {
   selectedLogPackage.value = "";
+  // 显式记录"用户清空了"，下次启动也不再回填默认值
+  localStorage.setItem(LOG_FILTER_PKG_KEY, "");
 }
 
 // 导出设备日志（adb logcat -d）到本地文本文件

@@ -15,6 +15,9 @@ import {
   FolderOpened,
   Close,
 } from "@element-plus/icons-vue";
+import { useFavoritesStore } from "../stores/favorites";
+
+const favStore = useFavoritesStore();
 
 interface FileInfo {
   name: string;
@@ -395,11 +398,15 @@ async function copySpValue(row: SpEntry) {
   }
 }
 
-// 从 localStorage 加载搜索记录
+// 应用包名搜索的默认值规则：
+// - localStorage 有非空值 → 用上次的输入
+// - 否则（null 或 ""）→ 回退到全局"最近一次关注"的包名
 onMounted(() => {
-  const savedSearch = localStorage.getItem("adb_tool_app_search");
-  if (savedSearch) {
-    searchQuery.value = savedSearch;
+  const stored = localStorage.getItem("adb_tool_app_search");
+  if (stored) {
+    searchQuery.value = stored;
+  } else if (favStore.lastFavorited) {
+    searchQuery.value = favStore.lastFavorited;
   }
 });
 

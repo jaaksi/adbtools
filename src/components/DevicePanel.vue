@@ -74,14 +74,16 @@ async function handleVersionDowngrade(
         confirmButtonText: "卸载并安装",
         cancelButtonText: "取消",
         distinguishCancelAndClose: true,
+        // MessageBox 即将关闭时立刻恢复安装遮罩，避免确认框消失到 loading 出现之间的空窗期
+        beforeClose: (_action, _instance, done) => {
+          installing.value = wasInstalling;
+          done();
+        },
       }
     );
     confirmed = true;
   } catch {
-    // 用户点取消/关闭/ESC
-  } finally {
-    // 继续后续流程（成功/失败/取消都）恢复之前的遮罩状态
-    installing.value = wasInstalling;
+    // 用户点取消/关闭/ESC（installing 已在 beforeClose 中恢复）
   }
 
   if (!confirmed) return "cancelled";

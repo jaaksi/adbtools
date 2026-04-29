@@ -12,7 +12,12 @@ import {
   Delete,
   Close,
   Key,
+  Star,
+  StarFilled,
 } from "@element-plus/icons-vue";
+import { useFavoritesStore } from "../stores/favorites";
+
+const favStore = useFavoritesStore();
 
 interface AppInfo {
   package_name: string;
@@ -34,7 +39,15 @@ const props = defineProps<{
 
 const apps = ref<AppInfo[]>([]);
 const loading = ref(false);
-const filter = ref("third");
+
+// 默认 filter：localStorage 优先；没存过则按是否有关注的应用决定（有 → 关注，无 → 三方）
+const FILTER_KEY = "adbtools:appFilter";
+const storedFilter = localStorage.getItem(FILTER_KEY);
+const filter = ref(
+  storedFilter ?? (favStore.hasFavorites ? "favorited" : "third")
+);
+watch(filter, (v) => localStorage.setItem(FILTER_KEY, v));
+
 const searchQuery = ref("");
 
 async function loadApps() {
@@ -44,11 +57,17 @@ async function loadApps() {
   }
   loading.value = true;
   try {
-    const filterType = filter.value === "all" ? null : filter.value;
-    apps.value = await invoke("get_installed_apps", {
+    // "favorited" 走全量列表，再用本地的关注集合过滤；其它直接传给后端
+    const filterType =
+      filter.value === "all" || filter.value === "favorited" ? null : filter.value;
+    const result = await invoke<AppInfo[]>("get_installed_apps", {
       serial: props.selectedDevice,
       filter: filterType,
     });
+    apps.value =
+      filter.value === "favorited"
+        ? result.filter((a) => favStore.isFavorite(a.package_name))
+        : result;
   } catch (error) {
     console.error("Failed to get apps:", error);
     ElMessage.error("获取应用列表失败");
@@ -221,6 +240,15 @@ async function togglePermission(perm: PermissionInfo, granted: boolean) {
   }
 }
 
+function toggleFavorite(pkg: string) {
+  const nowFav = favStore.toggle(pkg);
+  ElMessage.success(nowFav ? `已关注 ${pkg}` : `已取消关注 ${pkg}`);
+  // 当前在「关注」分类时，取消关注后从列表移除
+  if (filter.value === "favorited" && !nowFav) {
+    apps.value = apps.value.filter((a) => a.package_name !== pkg);
+  }
+}
+
 async function bulkSetPermissions(granted: boolean) {
   if (!permTargetPackage.value) return;
   const targets = filteredPermissions.value.filter((p) => p.granted !== granted);
@@ -271,6 +299,11 @@ watch(filter, loadApps);
           clearable
         />
         <el-select v-model="filter" style="width: 120px">
+          <el-option
+            label="关注的应用"
+            value="favorited"
+            :disabled="!favStore.hasFavorites"
+          />
           <el-option label="全部应用" value="all" />
           <el-option label="系统应用" value="system" />
           <el-option label="第三方应用" value="third" />
@@ -302,9 +335,17 @@ watch(filter, loadApps);
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="360" fixed="right">
+      <el-table-column label="操作" width="450" fixed="right">
         <template #default="{ row }">
           <el-button-group>
+            <el-button
+              size="small"
+              :icon="favStore.isFavorite(row.package_name) ? StarFilled : Star"
+              :type="favStore.isFavorite(row.package_name) ? 'warning' : ''"
+              @click="toggleFavorite(row.package_name)"
+            >
+              {{ favStore.isFavorite(row.package_name) ? "已关注" : "关注" }}
+            </el-button>
             <el-button size="small" :icon="VideoPlay" @click="startApp(row.package_name)">
               启动
             </el-button>
