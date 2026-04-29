@@ -15,6 +15,7 @@ import {
   Close,
   CopyDocument,
   Aim,
+  DataAnalysis,
 } from "@element-plus/icons-vue";
 import { useFavoritesStore } from "../stores/favorites";
 
@@ -105,6 +106,30 @@ watch(
 const LOG_FILTER_PKG_KEY = "adbtools:logFilterPkg";
 const _storedLogPkg = localStorage.getItem(LOG_FILTER_PKG_KEY);
 const selectedLogPackage = ref(_storedLogPkg || favStore.lastFavorited);
+
+// 埋点调试相关
+const ANALYTICS_PKG_KEY = "adbtools:analyticsDebugPkg";
+const ANALYTICS_PROJECT_KEY = "adbtools:analyticsProjectId";
+const _storedAnalyticsPkg = localStorage.getItem(ANALYTICS_PKG_KEY);
+const selectedAnalyticsPackage = ref(
+  _storedAnalyticsPkg || favStore.lastFavorited
+);
+const analyticsProjectId = ref(
+  localStorage.getItem(ANALYTICS_PROJECT_KEY) || ""
+);
+watch(analyticsProjectId, (v) => {
+  localStorage.setItem(ANALYTICS_PROJECT_KEY, v || "");
+});
+const analyticsLoading = ref(false);
+
+// 应用选择浮层支持多个目标场景
+type PickerTarget = "log" | "analytics";
+const pickerTarget = ref<PickerTarget>("log");
+const currentTargetSelectedPkg = computed(() =>
+  pickerTarget.value === "analytics"
+    ? selectedAnalyticsPackage.value
+    : selectedLogPackage.value
+);
 const appPickerVisible = ref(false);
 const appPickerLoading = ref(false);
 const appList = ref<AppInfo[]>([]);
@@ -230,7 +255,8 @@ async function takeScreenshot() {
 }
 
 // 打开应用选择弹窗并加载第三方应用列表
-async function openAppPicker() {
+async function openAppPicker(target: PickerTarget = "log") {
+  pickerTarget.value = target;
   if (!props.selectedDevice) {
     ElMessage.warning("请先选择设备");
     return;
@@ -256,16 +282,63 @@ async function loadApps() {
   }
 }
 
-function selectAppForLog(app: AppInfo) {
-  selectedLogPackage.value = app.package_name;
-  localStorage.setItem(LOG_FILTER_PKG_KEY, app.package_name);
-  appPickerVisible.value = false;
+function selectAppForCurrentTarget(app: AppInfo) {
+  if (pickerTarget.value === "analytics") {
+    selectedAnalyticsPackage.value = app.package_name;
+    localStorage.setItem(ANALYTICS_PKG_KEY, app.package_name);
+    appPickerVisible.value = false;
+    // 选中后立即触发埋点调试
+    runAnalyticsDebug();
+  } else {
+    selectedLogPackage.value = app.package_name;
+    localStorage.setItem(LOG_FILTER_PKG_KEY, app.package_name);
+    appPickerVisible.value = false;
+  }
 }
 
 function clearSelectedLogPackage() {
   selectedLogPackage.value = "";
   // 显式记录"用户清空了"，下次启动也不再回填默认值
   localStorage.setItem(LOG_FILTER_PKG_KEY, "");
+}
+
+function clearSelectedAnalyticsPackage() {
+  selectedAnalyticsPackage.value = "";
+  localStorage.setItem(ANALYTICS_PKG_KEY, "");
+}
+
+async function runAnalyticsDebug() {
+  if (!props.selectedDevice) {
+    ElMessage.warning("请先选择设备");
+    return;
+  }
+  if (!selectedAnalyticsPackage.value) {
+    // 未选包名 → 弹选择浮层（选完会回调到这里）
+    openAppPicker("analytics");
+    return;
+  }
+  analyticsLoading.value = true;
+  try {
+    const result = await invoke<string>("enable_analytics_debug", {
+      serial: props.selectedDevice,
+      package: selectedAnalyticsPackage.value,
+    });
+    ElMessage.success(result || "已开启埋点调试");
+    // 项目 ID 非空时才自动跳转 Firebase 控制台对应的 Android 应用设置页
+    const projectId = analyticsProjectId.value.trim();
+    if (projectId) {
+      const url = `https://console.firebase.google.com/u/0/project/${projectId}/analytics/app/android:${selectedAnalyticsPackage.value}/debugview/realtime~2Fdebugview`;
+      try {
+        await invoke("open_url", { url });
+      } catch (e) {
+        console.error("打开 Firebase 控制台失败:", e);
+      }
+    }
+  } catch (e) {
+    ElMessage.error(`开启失败: ${e}`);
+  } finally {
+    analyticsLoading.value = false;
+  }
 }
 
 // 导出设备日志（adb logcat -d）到本地文本文件
@@ -598,17 +671,72 @@ onBeforeUnmount(() => {
         </el-card>
       </el-col>
 
+      <el-col :span="12" style="margin-top: 20px">
+        <el-card class="tool-card log-card">
+          <template #header>
+            <div class="card-header">
+              <el-icon><DataAnalysis /></el-icon>
+              <span>埋点调试</span>
+            </div>
+          </template>
+          <p class="tool-desc">
+            开启 Firebase Analytics DebugView：先 setprop .none. 再 setprop 目标包名，
+            完成后自动跳转 Firebase 控制台
+          </p>
+          <div class="log-actions analytics-actions">
+            <el-input
+              v-model="analyticsProjectId"
+              placeholder="Firebase 项目 ID"
+              size="default"
+              clearable
+              class="analytics-project-input"
+            />
+            <el-button
+              type="primary"
+              :icon="DataAnalysis"
+              :loading="analyticsLoading"
+              @click="runAnalyticsDebug"
+            >
+              调试应用
+            </el-button>
+            <el-button :icon="Search" @click="openAppPicker('analytics')">
+              选择应用
+            </el-button>
+          </div>
+          <div class="log-selected-pkg">
+            <span class="log-selected-label">调试应用：</span>
+            <el-tag
+              v-if="selectedAnalyticsPackage"
+              closable
+              type="success"
+              @close="clearSelectedAnalyticsPackage"
+            >
+              {{ selectedAnalyticsPackage }}
+            </el-tag>
+            <span v-else class="log-selected-empty">未选择（点击「调试应用」会先选）</span>
+          </div>
+        </el-card>
+      </el-col>
+
       <!-- 应用选择弹窗 -->
       <el-dialog
         v-model="appPickerVisible"
-        title="选择要过滤的应用"
+        :title="pickerTarget === 'analytics' ? '选择埋点调试应用' : '选择要过滤的应用'"
         width="520px"
         append-to-body
       >
-        <div v-if="selectedLogPackage" class="app-picker-current">
+        <div v-if="currentTargetSelectedPkg" class="app-picker-current">
           <span class="log-selected-label">当前已选：</span>
-          <el-tag closable type="success" @close="clearSelectedLogPackage">
-            {{ selectedLogPackage }}
+          <el-tag
+            closable
+            type="success"
+            @close="
+              pickerTarget === 'analytics'
+                ? clearSelectedAnalyticsPackage()
+                : clearSelectedLogPackage()
+            "
+          >
+            {{ currentTargetSelectedPkg }}
           </el-tag>
         </div>
         <el-input
@@ -629,8 +757,8 @@ onBeforeUnmount(() => {
             v-for="app in filteredAppList"
             :key="app.package_name"
             class="app-picker-item"
-            :class="{ active: app.package_name === selectedLogPackage }"
-            @click="selectAppForLog(app)"
+            :class="{ active: app.package_name === currentTargetSelectedPkg }"
+            @click="selectAppForCurrentTarget(app)"
           >
             {{ app.package_name }}
           </div>
@@ -819,6 +947,15 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
+}
+
+.analytics-actions {
+  flex-wrap: nowrap;
+}
+
+.analytics-project-input {
+  flex: 1;
+  min-width: 0;
 }
 
 .log-selected-pkg {

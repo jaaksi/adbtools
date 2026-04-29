@@ -313,7 +313,9 @@ html, body {
 
 .main-body {
   flex: 1;
+  min-width: 0;
   overflow-y: auto;
+  overflow-x: hidden;
 }
 
 /* 隐藏滚动条 */

@@ -1236,6 +1236,18 @@ fn stop_screen_record(save_path: String, state: State<'_, RecordingState>) -> Re
     Ok("Screen recording saved successfully".to_string())
 }
 
+// Firebase Analytics 埋点调试：先清空 → 再设置目标包名
+#[tauri::command]
+fn enable_analytics_debug(serial: &str, package: &str) -> Result<String, String> {
+    run_adb_command(&[
+        "-s", serial, "shell", "setprop", "debug.firebase.analytics.app", ".none.",
+    ])?;
+    run_adb_command(&[
+        "-s", serial, "shell", "setprop", "debug.firebase.analytics.app", package,
+    ])?;
+    Ok(format!("已开启 Firebase 埋点调试：{}", package))
+}
+
 // 导出设备日志到本地文件（adb logcat -d 获取全部缓冲区快照）
 // buffers: 可选，形如 "main,system,crash"，默认使用 "all"
 // package: 可选包名，若指定则通过 pidof 取 PID，再按 threadtime 格式过滤 PID 列
@@ -1826,6 +1838,7 @@ pub fn run() {
             delete_file,
             take_screenshot,
             export_logcat,
+            enable_analytics_debug,
             start_screen_record,
             stop_screen_record,
             cancel_screen_record,
