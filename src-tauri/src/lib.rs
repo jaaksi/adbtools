@@ -8,7 +8,7 @@ use std::sync::mpsc::{channel, Sender, TryRecvError};
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 pub struct OAuthState(pub Mutex<Option<Sender<()>>>);
 
@@ -1756,6 +1756,69 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(OAuthState(Mutex::new(None)))
         .manage(RecordingState(Mutex::new(None)))
+        .setup(|app| {
+            use tauri::menu::{Menu as TrayMenu, MenuItem as TrayMenuItem};
+            use tauri::tray::{
+                MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent,
+            };
+
+            let show_item =
+                TrayMenuItem::with_id(app, "tray_show", "显示窗口", true, None::<&str>)?;
+            let hide_item =
+                TrayMenuItem::with_id(app, "tray_hide", "隐藏窗口", true, None::<&str>)?;
+            let quit_item =
+                TrayMenuItem::with_id(app, "tray_quit", "退出", true, None::<&str>)?;
+            let tray_menu =
+                TrayMenu::with_items(app, &[&show_item, &hide_item, &quit_item])?;
+
+            let _tray = TrayIconBuilder::with_id("main")
+                .icon(tauri::include_image!("icons/tray.png"))
+                .icon_as_template(true)
+                .tooltip("ADB Tools")
+                .menu(&tray_menu)
+                // 左键点击图标 → 切换显示/隐藏窗口；右键弹出菜单
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "tray_show" => {
+                        for (_, w) in app.webview_windows() {
+                            let _ = w.show();
+                            let _ = w.set_focus();
+                        }
+                    }
+                    "tray_hide" => {
+                        for (_, w) in app.webview_windows() {
+                            let _ = w.hide();
+                        }
+                    }
+                    "tray_quit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        let app = tray.app_handle();
+                        for (_, w) in app.webview_windows() {
+                            // 已显示就隐藏，已隐藏就显示并 focus
+                            match w.is_visible() {
+                                Ok(true) => {
+                                    let _ = w.hide();
+                                }
+                                _ => {
+                                    let _ = w.show();
+                                    let _ = w.set_focus();
+                                }
+                            }
+                        }
+                    }
+                })
+                .build(app)?;
+
+            Ok(())
+        })
         .menu(|handle| {
             // 在系统默认菜单的 Help 子菜单里追加"下载 ADB"；
             // 同时把 dev 模式下 macOS App 菜单里继承自 bin 名的 "AdbTools" 强制改成 "ADB Tools"
@@ -1877,6 +1940,34 @@ pub fn run() {
             list_runtime_permissions,
             set_permission,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        // 关闭按钮 → 隐藏窗口而不是退出（macOS 习惯：App 留在 Dock，点击图标恢复）
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = window.hide();
+                    api.prevent_close();
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = (window, api);
+                }
+            }
+        })
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        // 主事件循环：拦截 Dock 图标点击（macOS Reopen），把已隐藏窗口重新唤出
+        .run(|app, event| {
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
+                if !has_visible_windows {
+                    for (_, window) in app.webview_windows() {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
+        });
 }
