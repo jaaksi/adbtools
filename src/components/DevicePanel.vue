@@ -43,11 +43,14 @@ const installing = ref(false);
 const installProgress = ref({ current: 0, total: 0, file: "" });
 let dragDropUnlisten: (() => void) | null = null;
 
-// 处理版本降级：解析包名 → 询问用户 → 卸载重装
+type ReinstallReason = "downgrade" | "signature";
+
+// 走"卸载已安装版本 → 重装"流程：解析包名 → 询问用户 → 卸载重装
 // 返回 "installed" | "cancelled" | "failed"
-async function handleVersionDowngrade(
+async function handleReinstallAfterUninstall(
   apkPath: string,
-  fileName: string
+  fileName: string,
+  reason: ReinstallReason
 ): Promise<"installed" | "cancelled" | "failed"> {
   // 尝试解析 APK 包名
   let packageName = "";
@@ -58,6 +61,11 @@ async function handleVersionDowngrade(
   }
 
   const pkgHint = packageName ? `（${packageName}）` : "";
+  const title = reason === "signature" ? "检测到签名不一致" : "检测到版本降级";
+  const detail =
+    reason === "signature"
+      ? `设备上已安装的 ${fileName}${pkgHint} 与待安装版本签名不一致。`
+      : `设备上已安装更高版本的 ${fileName}${pkgHint}。`;
 
   // 弹确认框前先关闭遮罩，否则 z-index 会把 MessageBox 整个盖住，
   // 用户看不到也点不到，流程会永远卡在这里
@@ -67,8 +75,8 @@ async function handleVersionDowngrade(
   let confirmed = false;
   try {
     await ElMessageBox.confirm(
-      `设备上已安装更高版本的 ${fileName}${pkgHint}。\n\n继续需要先卸载该应用，此操作会清空应用数据，是否继续？`,
-      "检测到版本降级",
+      `${detail}\n\n继续需要先卸载该应用，此操作会清空应用数据，是否继续？`,
+      title,
       {
         type: "warning",
         confirmButtonText: "卸载并安装",
@@ -152,15 +160,30 @@ async function installApkFiles(paths: string[]) {
         successCount++;
       } catch (error) {
         const msg = String(error);
-        // 版本降级：已安装的版本高于待安装的，提示用户确认卸载后重装
-        if (msg.includes("INSTALL_FAILED_VERSION_DOWNGRADE")) {
-          const handled = await handleVersionDowngrade(apkPath, fileName);
+        // 需要"先卸载再装"的两种典型场景：
+        //   1. INSTALL_FAILED_VERSION_DOWNGRADE — 设备上版本更高
+        //   2. INSTALL_FAILED_UPDATE_INCOMPATIBLE — 已装的与新包签名不一致
+        const reason: ReinstallReason | null = msg.includes(
+          "INSTALL_FAILED_VERSION_DOWNGRADE"
+        )
+          ? "downgrade"
+          : msg.includes("INSTALL_FAILED_UPDATE_INCOMPATIBLE") ||
+              msg.includes("signatures do not match")
+            ? "signature"
+            : null;
+        if (reason) {
+          const handled = await handleReinstallAfterUninstall(
+            apkPath,
+            fileName,
+            reason
+          );
           if (handled === "installed") {
             successCount++;
             continue;
           }
+          const reasonText = reason === "signature" ? "签名不一致" : "版本降级";
           if (handled === "cancelled") {
-            failed.push(`${fileName}: 已取消（检测到版本降级）`);
+            failed.push(`${fileName}: 已取消（检测到${reasonText}）`);
             continue;
           }
           failed.push(`${fileName}: 卸载重装失败`);
