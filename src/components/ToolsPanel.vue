@@ -46,13 +46,20 @@ const topActivityLoading = ref(false);
 const topActivityPolling = ref(false);
 let topActivityTimer: number | null = null;
 
+// 去掉 "pkg/" 前缀，只保留 Activity 部分
+function stripPackage(raw: string): string {
+  const slash = raw.indexOf("/");
+  return slash < 0 ? raw : raw.slice(slash + 1);
+}
+
 async function fetchTopActivity() {
   if (!props.selectedDevice) return;
   topActivityLoading.value = true;
   try {
-    topActivity.value = await invoke<string>("get_top_activity", {
+    const raw = await invoke<string>("get_top_activity", {
       serial: props.selectedDevice,
     });
+    topActivity.value = stripPackage(raw);
     topActivityError.value = "";
   } catch (e) {
     topActivityError.value = String(e);
@@ -73,7 +80,7 @@ function onTopActivityPollingChange(v: boolean | string | number) {
   stopTopActivityPolling();
   if (topActivityPolling.value) {
     fetchTopActivity();
-    topActivityTimer = window.setInterval(fetchTopActivity, 1000);
+    topActivityTimer = window.setInterval(fetchTopActivity, 300);
   }
 }
 
@@ -785,7 +792,7 @@ onBeforeUnmount(() => {
             </div>
           </template>
           <p class="tool-desc">
-            读取 dumpsys window 的 mCurrentFocus；开启轮询后每秒刷新一次
+            读取 dumpsys window 的 mCurrentFocus；开启轮询后每 300ms 刷新一次
           </p>
           <div class="top-activity-row">
             <el-input
