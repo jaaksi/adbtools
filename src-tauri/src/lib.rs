@@ -621,11 +621,49 @@ fn push_file(serial: &str, local_path: &str, remote_path: &str) -> Result<String
 
 #[tauri::command]
 fn pull_file(serial: &str, remote_path: &str, local_path: &str) -> Result<String, String> {
-    run_adb_command(&["-s", serial, "pull", remote_path, local_path])
+    // 先尝试普通 adb pull
+    let pull_res = run_adb_command(&["-s", serial, "pull", remote_path, local_path]);
+    if pull_res.is_ok() {
+        return pull_res;
+    }
+    let err = pull_res.unwrap_err();
+
+    // /data/data/<pkg>/<rel> 下的文件在非 root 设备 adb pull 必然失败，
+    // 走 run-as 回退（与 preview_remote_file 行为一致）
+    if remote_path.starts_with("/data/data/") {
+        let after = &remote_path[11..];
+        if let Some(i) = after.find('/') {
+            let pkg = &after[..i];
+            let rel = &after[i + 1..];
+            exec_out_run_as_cat(serial, pkg, rel, std::path::Path::new(local_path))?;
+            return Ok(format!("已通过 run-as 拉取到 {}", local_path));
+        }
+    }
+    Err(err)
 }
 
 #[tauri::command]
 fn delete_file(serial: &str, remote_path: &str) -> Result<String, String> {
+    // /data/data/<pkg>/<rel> 下的文件在非 root 设备直接 rm 会 Permission denied，
+    // 走 run-as 回退（与 pull/preview 行为一致）
+    if remote_path.starts_with("/data/data/") {
+        let after = &remote_path[11..];
+        if let Some(i) = after.find('/') {
+            let pkg = &after[..i];
+            let rel = &after[i + 1..];
+            let output = Command::new(adb_path()?)
+                .args(["-s", serial, "shell", "run-as", pkg, "rm", "-rf", rel])
+                .output()
+                .map_err(|e| format!("run-as rm 执行失败: {}", e))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "run-as rm 失败: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+        }
+    }
     run_adb_command(&["-s", serial, "shell", "rm", "-rf", remote_path])
 }
 

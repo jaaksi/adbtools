@@ -2,6 +2,7 @@
 import { ref, watch, onMounted, onBeforeUnmount } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ElMessage, ElMessageBox, ElNotification } from "element-plus";
 import { Plus, Refresh, UploadFilled } from "@element-plus/icons-vue";
 
@@ -102,6 +103,12 @@ async function handleReinstallAfterUninstall(
     );
     return "failed";
   }
+
+  // 等两帧，让 WebKit 完成 MessageBox 退场 + loading 入场的绘制，
+  // 否则后续同步 IPC 会阻塞 paint，弹窗看起来卡到安装完才消失
+  await new Promise<void>((resolve) =>
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+  );
 
   try {
     await invoke("uninstall_app", {
@@ -259,6 +266,11 @@ onMounted(async () => {
     } else if (t === "drop") {
       // 先关掉拖拽提示，loading 由 installApkFiles 在真正执行 adb 前点亮
       dragActive.value = false;
+      // 拖拽来源应用（如 Finder）仍持有焦点，强制激活本窗口，
+      // 否则 macOS 的 "first click in inactive window" 行为会吞掉弹窗按钮的第一次点击
+      getCurrentWindow()
+        .setFocus()
+        .catch((e) => console.warn("setFocus 失败:", e));
       installApkFiles(event.payload.paths);
     }
     // 注意：有意忽略 "over" 事件 —— 松手瞬间 Tauri 可能在 drop 之后紧跟一个 over，
