@@ -1,16 +1,15 @@
 {
-  "$schema": "https://schema.tauri.app/config/2",
+  "$schema": "https://schema.tauri.app/conf/",
   "productName": "ADB Tools",
   "version": "0.1.2",
   "identifier": "com.adbtools.app",
   "build": {
     "beforeDevCommand": "pnpm dev",
-    "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "pnpm build",
     "frontendDist": "../dist"
   },
   "app": {
-    "windows": [
+     "windows": [
       {
         "title": "ADB Tools",
         "width": 1200,
@@ -25,12 +24,12 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://accounts.google.com https://apis.google.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://*.google.com https://*.gstatic.com https://*.googleusercontent.com; connect-src 'self' ipc: http://ipc.localhost https://accounts.google.com https://www.googleapis.com https://oauth2.googleapis.com; frame-src https://accounts.google.com"
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://accounts.google.com https://apis.google.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://*.-google.com https://*.gstatic.com https://*.googleusercontent.com; connect-src 'self' ipc: tauri: https://accounts.google.com https://www.googleapis.com https://oauth2.googleapis.com; frame-src https://accounts.google.com; font-src 'self' data; worker-src 'self' blob:"
     }
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["deb","rpm"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -38,6 +37,11 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "linux": {
+      "appimage": {
+        "bundleMediaFramework": false
+      }
+    },
     "macOS": {
       "signingIdentity": "-"
     }
